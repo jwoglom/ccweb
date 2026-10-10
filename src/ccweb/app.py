@@ -12,7 +12,9 @@ import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from rich.cells import cell_len
@@ -42,18 +44,16 @@ from .api import (
     parse_session_ref,
     web_url,
 )
+from .groups import Group, Grouping
 from .links import LinkContext, is_openable, link_style, linkify_markdown, linkify_text
-from .prinfo import BranchStatus, Details, PullRequest, best_pr_state, check_counts, relevant
+from .prinfo import BranchStatus, Check, Details, PullRequest, best_pr_state, check_counts, ref_key, relevant
+from .panes import ChangesPane, FilesPane, PlanPane
+from .repoinfo import ChangedFile, Comparison, Target, gh_commit_files, gh_compare, gh_file, gh_tree, targets_for
 from .store import Store
+from .tasks import TaskBoard
+from .widgets import Chip
 
-CLAY = "#d4835f"
-SAND = "#e8e4dc"
-MUTED = "#8f897f"
-AMBER = "#e0b354"
-SAGE = "#8db580"
-BRICK = "#e06c5f"
-BLUE = "#6f9be8"
-PURPLE = "#a78bfa"
+from .palette import AMBER, BLUE, BRICK, CLAY, MUTED, PURPLE, SAGE, SAND  # noqa: F401  (re-exported for tests)
 PR_COLOURS = {"open": SAGE, "draft": MUTED, "merged": PURPLE, "closed": BRICK}
 PR_ICON_COLOURS = {"open": "#b9b3a8", "draft": "#b9b3a8", "merged": PURPLE, "closed": BRICK}  # the web's sidebar tints
 CHECK_GLYPHS = {"success": ("✓", SAGE), "failure": ("✗", BRICK), "pending": ("◔", AMBER), "skipped": ("–", MUTED)}
@@ -217,7 +217,54 @@ def welcome_name() -> str:
     return ""
 
 
-def pr_line(status: BranchStatus, details: Details | None = None) -> Text:
+def ci_summary(checks: list[Check]) -> tuple[str, str] | None:
+    """One phrase for where CI stands, and its colour; None when there's no CI to speak of."""
+    if not checks:
+        return None
+    passing, failing, pending = check_counts(checks)
+    if failing and pending:
+        return "CI failing", BRICK  # something has failed and the rest is still going
+    if failing:
+        return "CI failed", BRICK
+    if pending:
+        return f"CI running {passing}/{len(checks)}", AMBER
+    return "CI passed", SAGE
+
+
+def row_summary(
+    session: Session, kind: str, shown: list[BranchStatus], checks_for: Callable[[PullRequest], list[Check]]
+) -> list[tuple[str, str]]:
+    """The second line of a sidebar row as (text, colour) parts: PR and CI state first, then what's useful without one."""
+    parts: list[tuple[str, str]] = []
+    if kind == "working":
+        parts.append(("Working", SAGE))
+    elif kind == "failed":
+        parts.append(("Failed", BRICK))
+    prs = [s.pr for s in shown if s.pr]
+    if prs:
+        pr = prs[0]
+        parts.append((f"{pr.state.capitalize()} #{pr.number}", PR_COLOURS.get(pr.state, MUTED)))
+        ci = ci_summary(checks_for(pr)) if pr.is_live else None
+        if ci:
+            parts.append(ci)
+        if len(prs) > 1:
+            parts.append((f"+{len(prs) - 1}", MUTED))  # more PRs than the one shown
+    elif shown:
+        noun = "commit" if shown[0].commits == 1 else "commits"
+        parts.append((f"{shown[0].commits} {noun} pushed, no PR", MUTED))
+    elif kind == "needs_input" and session.needs_action:
+        parts.append((" ".join(session.needs_action.split()), AMBER))
+    elif session.summary:
+        parts.append((" ".join(session.summary.split()), MUTED))
+    elif session.repo:
+        parts.append((short_repo(session.repo), MUTED))
+    when = relative_time(session.last_activity)
+    if when:
+        parts.append((when, MUTED))
+    return parts
+
+
+def pr_line(status: BranchStatus, details: Details | None = None, checks: list[Check] | None = None) -> Text:
     """One line about a PR, or about a pushed branch that has none yet."""
     line = Text(no_wrap=True, overflow="ellipsis")
     pr = status.pr
@@ -235,9 +282,9 @@ def pr_line(status: BranchStatus, details: Details | None = None) -> Text:
         line.append("  ")
         line.append(f"+{pr.additions}", style=SAGE)
         line.append(f" −{pr.deletions}", style=BRICK)
-    checks = (details.checks if details and details.checks else pr.checks) if pr.is_live else []
-    if checks:
-        passing, failing, pending = check_counts(checks)
+    found = (details.checks if details and details.checks else checks or pr.checks) if pr.is_live else []
+    if found:
+        passing, failing, pending = check_counts(found)
         line.append("  CI", style=MUTED)
         for glyph_key, count in (("success", passing), ("failure", failing), ("pending", pending)):
             if count:
@@ -363,6 +410,20 @@ class ChoiceScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+@dataclass
+class Echo:
+    """A message you just sent, shown at once. The server records it only when the session wakes up and
+    takes it in, which for an idle one can be a while; the real copy replaces this when it arrives."""
+
+    text: str
+    widgets: list
+    status: Static
+
+
+def same_text(text: str) -> str:
+    return " ".join(text.split())
 
 
 @dataclass
@@ -657,10 +718,12 @@ HELP_KEYS = [
     ("i", "Add a session by link or ID"),
     ("m", "Session menu (also: right-click, or the ⋮ button)"),
     ("o / y", "Open on claude.ai / copy link"),
-    ("d", "Pull request: checks, files and diff"),
+    ("d / f / p", "Panels on the right: Changes, Files, Plan (z expands)"),
+    ("D", "Pull request summary and CI checks"),
     ("t / c", "Teleport / set local checkout"),
     ("/", "Search sessions"),
     ("v", "Show or hide archived"),
+    ("g", "Show or hide groups (made with m > Move to group)"),
     ("r", "Refresh now"),
     ("x", "Forget a locally saved session"),
     ("esc", "Back to the session list"),
@@ -704,16 +767,6 @@ class RowList(OptionList):
     def _on_click(self, event: events.Click) -> None:
         if event.button != 1:
             event.prevent_default()  # stops OptionList's own handler, which doesn't look at the button
-
-
-class Chip(Button):
-    """A compact, focusable setting on the new-session form."""
-
-    def __init__(self, label: str, what: str, index: int = -1, tip: str = "", classes: str = ""):
-        super().__init__(label, compact=True, classes=f"chip {classes}".strip())
-        self.what, self.index = what, index
-        if tip:
-            self.tooltip = tip
 
 
 # ---------------------------------------------------------------------- app
@@ -780,8 +833,32 @@ class CloudSessionsApp(App):
     Chip.remove {{ margin-left: 0; color: {MUTED}; padding: 0 1; background: $surface; }}
     Chip.plain {{ background: $background; color: {MUTED}; }}
 
+    #convo {{ height: 1fr; }}
+    #convo-main {{ width: 1fr; }}
+    #side {{ display: none; width: 58%; border-left: tall $panel; padding: 0 0 0 1; }}
+    #side.max {{ width: 100%; border-left: none; padding: 0; }}
+    PlanPane, FilesPane, ChangesPane {{ display: none; }}
+    PlanPane {{ height: auto; max-height: 45%; margin-bottom: 1; }}
+    FilesPane, ChangesPane {{ height: 1fr; }}
+    .pane-head {{ height: 1; margin: 1 0; }}
+    .pane-title {{ width: 1fr; text-style: bold; color: {SAND}; }}
+    .pane-head Chip {{ margin-left: 1; margin-right: 0; }}
+    #plan-scroll {{ height: auto; max-height: 100%; }}
+    #plan-body {{ padding: 0 1; }}
+    #changes-body, #files-body {{ height: 1fr; }}
+    #changes-left {{ width: 38; }}
+    #changes-tree, #files-tree {{ background: $background; padding: 0; }}
+    #changes-tree {{ height: 1fr; }}
+    #files-tree {{ width: 34; }}
+    #commits-label {{ margin-top: 1; padding: 0 1; }}
+    #changes-commits {{ height: 40%; background: $background; border: none; padding: 0; }}
+    #changes-diff-scroll, #files-view-scroll {{ width: 1fr; height: 1fr; background: $background; }}
+    #changes-diff, #files-view {{ width: auto; min-width: 100%; height: auto; padding: 0 1; }}
+    #files-search {{ border: tall $panel; background: $surface; margin-bottom: 1; }}
+    #files-search:focus {{ border: tall {CLAY}; }}
+    #header-row Chip.on {{ background: {CLAY} 45%; }}
     #header-row {{ height: auto; border-bottom: hkey $panel; }}
-    #session-header {{ width: 1fr; height: auto; padding: 1 0; }}
+    #session-header {{ width: 1fr; height: auto; padding: 1 0 1 0; }}
     #header-row Chip {{ margin: 1 0 0 1; }}
     #transcript {{ height: 1fr; background: $background; border: none; padding: 1 1 0 0; scrollbar-size-vertical: 1; }}
     #transcript Static {{ width: 100%; height: auto; }}
@@ -792,7 +869,7 @@ class CloudSessionsApp(App):
     #transcript Markdown MarkdownBlock {{ color: {SAND}; }}
     #transcript Markdown MarkdownFence {{ background: $surface; }}
     #activity {{ height: 1; color: {SAGE}; }}
-    #pr-bar {{ height: auto; padding: 0 0 1 0; }}
+    #context-bar {{ height: auto; padding: 0 1; }}
     #composer {{ margin: 0 0 1 0; border: tall $panel; background: $surface; }}
     #composer:focus {{ border: tall {CLAY}; }}
 
@@ -824,12 +901,17 @@ class CloudSessionsApp(App):
         Binding("i", "add_session", "Add by link"),
         Binding("o", "open_web", "Open on web"),
         Binding("m", "session_menu", "Menu"),
-        Binding("d", "pull_request", "PR & diff"),
+        Binding("d", "toggle_changes", "Changes"),
+        Binding("f", "toggle_files", "Files"),
+        Binding("p", "toggle_plan", "Plan"),
+        Binding("z", "toggle_side_max", "Expand panel", show=False),
+        Binding("D", "pull_request", "PR checks", show=False),
         Binding("t", "teleport", "Teleport"),
         Binding("y", "copy_link", "Copy link"),
         Binding("c", "set_checkout", "Checkout path", show=False),
         Binding("slash", "search", "Search"),
         Binding("v", "toggle_archived", "Archived"),
+        Binding("g", "toggle_groups", "Groups"),
         Binding("r", "refresh", "Refresh", show=False),
         Binding("x", "forget", "Forget", show=False),
         Binding("escape", "focus_sessions", "Sessions", show=False),
@@ -851,17 +933,30 @@ class CloudSessionsApp(App):
         self.visible_limit = PAGE
         self.selected: str | None = None
         self.rendered_keys: set[str] = set()
+        self.echoes: list[Echo] = []
+        self._ticks = 0
         self.events_cursor: str | None = None
         self.events_error_for: str | None = None
         self.api_ok = False
         self.loaded_once = False
         self.show_archived = False
+        self.group_view = self.store.grouping.grouped
         self.filter_text = ""
         self.optimistic: dict[str, float] = {}
         self.frame = 0
         self.envs: list[Environment] = []
         self.branches: dict[str, list[BranchStatus]] = {}  # per session: PRs and pushed branches
         self.details: dict[str, Details] = {}  # per PR url: what gh adds (CI, files)
+        self.side_open = {"plan": False, "files": False, "changes": False}
+        self.side_max = False
+        self.target_idx: dict[str, int] = {}  # per session: which comparison the Changes and Files panels show
+        self.changes_commit: str | None = None  # a single commit picked in Changes, or None for all changes
+        self.cmp_cache: dict[tuple, tuple[float, Comparison]] = {}
+        self.commit_cache: dict[tuple, list[ChangedFile]] = {}
+        self.tree_cache: dict[tuple, tuple[float, list[str], bool, str]] = {}
+        self._pane_sig: dict[str, Any] = {}
+        self.board = TaskBoard()  # the open session's plan, rebuilt from its conversation
+        self.checks: dict[tuple[str, int], list[Check]] = {}  # CI for live PRs of the newest sessions, from one gh call
         self.draft = self._initial_draft()
         self._seeded = False
         self._closing = False
@@ -905,14 +1000,22 @@ class CloudSessionsApp(App):
                                 yield Chip("", "model", classes="plain", tip="Model")
                                 yield Chip("", "effort", classes="plain", tip="Effort")
                             yield Static("enter starts the session · tab moves between settings · esc, then ? lists keys", id="hint")
-                    with Vertical(id="convo"):
-                        with Horizontal(id="header-row"):
-                            yield Static("", id="session-header")
-                            yield Chip("⋮", "menu", classes="plain", tip="Session menu (m, or right-click a session)")
-                        yield Static("", id="pr-bar")
-                        yield VerticalScroll(id="transcript")
-                        yield Static("", id="activity")
-                        yield Input(placeholder="Reply to this session", id="composer")
+                    with Horizontal(id="convo"):
+                        with Vertical(id="convo-main"):
+                            with Horizontal(id="header-row"):
+                                yield Static("", id="session-header")
+                                yield Chip("±", "toggle:changes", tip="Changes: files, commits and diffs (d)", classes="plain")
+                                yield Chip("▤", "toggle:files", tip="Files in the repository (f)", classes="plain")
+                                yield Chip("✓", "toggle:plan", tip="Plan: Claude's task list (p)", classes="plain")
+                                yield Chip("⋮", "menu", classes="plain", tip="Session menu (m, or right-click a session)")
+                            yield VerticalScroll(id="transcript")
+                            yield Static("", id="activity")
+                            yield Static("", id="context-bar")
+                            yield Input(placeholder="Reply to this session", id="composer")
+                        with Vertical(id="side"):
+                            yield PlanPane(id="pane-plan")
+                            yield FilesPane(id="pane-files")
+                            yield ChangesPane(id="pane-changes")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1021,9 +1124,33 @@ class CloudSessionsApp(App):
         try:
             self._render_list()
             self._render_attention()
-            self._render_prbar()
+            self._render_context()
         except NoMatches:  # the app was closed while the request was in flight
             pass
+        if not prinfo.gh_available():
+            return
+        live = {
+            ref_key(s.pr.repo, s.pr.number): (s.pr.repo, s.pr.number)
+            for sid in found
+            for s in relevant(self.branches.get(sid, []))
+            if s.pr and s.pr.is_live
+        }
+        if not live:
+            return
+        checks = await asyncio.to_thread(prinfo.gh_checks_batch, list(live.values()))
+        self.checks.update(checks)
+        try:
+            self._render_list()
+            self._render_context()
+        except NoMatches:
+            pass
+
+    def _checks_for(self, pr: PullRequest) -> list[Check]:
+        """The best CI information held for a PR: the open session's own detail, else the batched lookup."""
+        details = self.details.get(pr.url)
+        if details and details.checks:
+            return details.checks
+        return self.checks.get(ref_key(pr.repo, pr.number)) or pr.checks
 
     @background(exclusive=True, group="pr-selected")
     async def refresh_selected_pr(self) -> None:
@@ -1043,26 +1170,47 @@ class CloudSessionsApp(App):
                 self.details[pr.url] = await asyncio.to_thread(prinfo.gh_details, pr.url)
         if self.selected == sid:
             try:
-                self._render_prbar()
+                self._render_context()
                 self._render_header()
                 self._update_row(sid)
+                self._reload_panes()
             except NoMatches:
                 pass
 
-    def _render_prbar(self) -> None:
-        bar = self.main.query_one("#pr-bar", Static)
-        shown = relevant(self.branches.get(self.selected or "", []))
-        if not shown:
+    def _render_context(self) -> None:
+        """The strip above the reply box: environment, repositories, the branch Claude pushes to, and PR/CI lines."""
+        bar = self.main.query_one("#context-bar", Static)
+        session = self.sessions.get(self.selected or "")
+        if session is None:
             bar.update("")
             return
         text = Text()
-        for index, status in enumerate(shown[:3]):
-            text.append("\n" if index else "")
-            text.append_text(pr_line(status, self.details.get(status.pr.url) if status.pr else None))
+        env = next((e.name for e in self.envs if e.id == session.environment_id), "")
+        if env:
+            text.append(f"☁ {env}", style=SAND)
+        sources = session.sources or ([(session.repo, "")] if session.repo else [])
+        owners = {repo.split("/")[0] for repo, _ in sources if "/" in repo}
+        for repo, revision in sources:
+            if not repo:
+                continue
+            text.append("   " if text.plain else "")
+            name = repo.split("/", 1)[-1] if len(owners) == 1 else repo
+            text.append(f"</> {name}", style=link_style(f"https://github.com/{repo}", SAND))
+            if revision:
+                text.append(f" ⎇ {revision}", style=link_style(f"https://github.com/{repo}/tree/{revision}", MUTED))
+        branches = list(dict.fromkeys(branch for _, branch in session.outcomes))
+        if len(branches) == 1:
+            text.append("\n" if text.plain else "")
+            text.append(f"⎇ {branches[0]}", style=MUTED)
+        elif branches:
+            text.append("\n" if text.plain else "")
+            text.append("   ".join(f"⎇ {repo.split('/', 1)[-1]}: {branch}" for repo, branch in session.outcomes), style=MUTED)
+        shown = relevant(self.branches.get(session.id, []))
+        for status in shown[:3]:
+            text.append("\n" if text.plain else "")
+            text.append_text(pr_line(status, self.details.get(status.pr.url) if status.pr else None, self._checks_for(status.pr) if status.pr else None))
         if len(shown) > 3:
             text.append(f"\n+{len(shown) - 3} more", style=MUTED)
-        if any(s.pr for s in shown):
-            text.append("\nd shows checks and the diff", style=MUTED)
         bar.update(text)
 
     @background(exclusive=True, group="more")
@@ -1084,10 +1232,12 @@ class CloudSessionsApp(App):
             return
         try:
             fresh: list[Message] = []
+            task_ops: list[dict] = []
             cursor = self.events_cursor
             for _ in range(20):  # a long session is several pages the first time, usually one afterwards
                 page = await self.api.list_events_page(sid, cursor)
                 fresh += page.messages
+                task_ops += page.task_ops
                 cursor = page.last_id or cursor
                 if not page.has_more or not page.messages:
                     break
@@ -1099,12 +1249,16 @@ class CloudSessionsApp(App):
         if self.selected != sid:
             return
         self.events_cursor = cursor
+        if task_ops:
+            self.board.apply(task_ops)
+            self._render_plan()
         shown = [m for m in fresh if m.kind != "event" and m.key not in self.rendered_keys]
         if not shown and not self.rendered_keys and not fresh:
             self._note("No messages yet.")
             self.rendered_keys.add("__empty__")
         for message in shown:
             self.rendered_keys.add(message.key)
+            self._reconcile_echo(message)
             self._write_message(message)
         try:  # the list only refreshes every so often; this keeps the open session's status current
             session = await self.api.get_session(sid)
@@ -1168,31 +1322,90 @@ class CloudSessionsApp(App):
         return by_recency(out)
 
     def _row(self, session: Session) -> Text:
+        """A sidebar row: the title, then a line of PR and CI status (or what else is worth knowing)."""
         pr_state = self._pr_state(session.id)
         glyph, colour, _ = describe_status(session, self.optimistic, self.frame, pr_state)
         kind = status_kind(session, self.optimistic, pr_state)
         if pr_state and not session.unread and kind not in {"working", "failed", "archived"}:
             glyph, colour = "⎇", PR_ICON_COLOURS.get(pr_state, MUTED)  # a seen session with a PR shows the PR, like the web
-        row = Text(no_wrap=True)
-        row.append(f"{glyph} ", style=colour)
-        row.append(session.title or session.id, style=SAND)
+        title = Text(no_wrap=True)
+        title.append(f"{glyph} ", style=colour)
+        title.append(session.title or session.id, style=SAND)
+        detail = Text(no_wrap=True)
+        detail.append("  ")
+        shown = relevant(self.branches.get(session.id, []))
+        for index, (part, part_colour) in enumerate(row_summary(session, kind, shown, self._checks_for)):
+            if index:
+                detail.append(" · ", style=MUTED)
+            detail.append(part, style=part_colour)
         width = self.main.query_one("#sessions", OptionList).size.width
         if width > 6:  # the list wraps long rows itself, so cut them with an ellipsis like the web does
-            row.truncate(width - 3, overflow="ellipsis")
-        return row
+            title.truncate(width - 3, overflow="ellipsis")
+            detail.truncate(width - 3, overflow="ellipsis")
+        return Text.assemble(title, "\n", detail)
+
+    def _sidebar_blocks(self, visible: list[Session], grouping: Grouping | None) -> list[tuple[str, list[Session], Group | None]]:
+        """The sidebar as (kind, sessions, group) blocks, top to bottom: pinned, each group, then the rest.
+
+        The rest, kind "sessions", is everything not placed above it, in the order given.
+        """
+        if grouping is None:
+            return [("sessions", visible, None)]
+        by_id = {s.id: s for s in visible}
+        pinned = [by_id[sid] for sid in grouping.pinned if sid in by_id]
+        placed = {s.id for s in pinned}
+        blocks: list[tuple[str, list[Session], Group | None]] = [("pinned", pinned, None)]
+        for group in grouping.groups:
+            members = by_recency(by_id[m] for m in dict.fromkeys(group.members) if m in by_id and m not in placed)
+            placed.update(m.id for m in members)
+            blocks.append(("group", members, group))
+        blocks.append(("sessions", [s for s in visible if s.id not in placed], None))
+        return blocks
+
+    def _active_grouping(self) -> Grouping | None:
+        grouping = self.store.grouping
+        return grouping if (grouping.groups or grouping.pinned) and self.group_view else None
 
     def _render_list(self) -> None:
         option_list = self.main.query_one("#sessions", OptionList)
         visible = self._visible_sessions()
         filtering = bool(self.filter_text)
-        shown = visible if filtering else visible[: self.visible_limit]
-        options: list[Option] = [Option(self._row(s), id=s.id) for s in shown]
-        hidden = len(visible) - len(shown)
-        if hidden > 0:
-            options.append(Option(Text(f"  Show {min(PAGE, hidden)} more", style=MUTED), id="__more__"))
+        stored = self.store.grouping
+        grouping = self._active_grouping()
+        heading = self.main.query_one("#list-heading", Static)
+        if not (stored.groups or stored.pinned):
+            heading.update("Ungrouped")
+        elif grouping is None:
+            heading.update("Ungrouped · g shows groups")
+        heading.display = grouping is None  # with groups on, the section headers say it all
+
+        options: list[Option] = []
+        shown_ids: set[str] = set()
+        for kind, members, group in self._sidebar_blocks(visible, grouping):
+            if kind == "pinned":
+                if members:
+                    options.append(Option(Text("Pinned", style=f"bold {MUTED}"), disabled=True))
+            elif kind == "group":
+                if not members:
+                    continue  # empty groups, and groups a search doesn't match, are left out
+                collapsed = group.collapsed and not filtering
+                options.append(self._group_header(group, len(members), collapsed))
+                if collapsed:
+                    continue
+            elif grouping is not None and members:
+                options.append(Option(Text("Ungrouped", style=f"bold {MUTED}"), disabled=True))
+            if kind == "sessions":
+                members_shown = members if filtering else members[: self.visible_limit]
+                hidden = len(members) - len(members_shown)
+            else:
+                members_shown, hidden = members, 0
+            options += [Option(self._row(s), id=s.id) for s in members_shown]
+            shown_ids.update(s.id for s in members_shown)
+            if hidden > 0:
+                options.append(Option(Text(f"  Show {min(PAGE, hidden)} more", style=MUTED), id="__more__"))
         if self.has_more and not filtering:
             options.append(Option(Text("Load more sessions", style=MUTED), id="__load__"))
-        target = self.selected if self.selected in {s.id for s in shown} else None
+        target = self.selected if self.selected in shown_ids else None
         scroll = option_list.scroll_y
         self._suppress_highlight = True
         try:
@@ -1206,6 +1419,46 @@ class CloudSessionsApp(App):
         if not options and self.loaded_once:
             empty = "No matches." if filtering else "No sessions yet. Press n to start one."
             option_list.add_option(Option(Text(empty, style=MUTED), disabled=True))
+
+    def _group_header(self, group: Group, count: int, collapsed: bool) -> Option:
+        text = Text(no_wrap=True, overflow="ellipsis")
+        text.append(f"{'▸' if collapsed else '▾'} {group.name}", style=f"bold {MUTED}")
+        text.append(f"  {count}", style=MUTED)
+        return Option(text, id=f"__grp__:{group.id}")
+
+    def action_toggle_groups(self) -> None:
+        grouping = self.store.grouping
+        if not (grouping.groups or grouping.pinned):
+            self.notify("No groups yet. Press m on a session and choose Move to group.", severity="warning", timeout=6)
+            return
+        self.group_view = not self.group_view
+        grouping.grouped = self.group_view
+        self.store.save_grouping(grouping)
+        self._render_list()
+
+    def _save_grouping(self, grouping: Grouping) -> None:
+        self.store.save_grouping(grouping)
+        self._render_list()
+
+    def _keep_header_highlighted(self, gid: str) -> None:
+        """After the rows under a group header change, leave the cursor on that header."""
+        try:
+            option_list = self.main.query_one("#sessions", OptionList)
+            self._suppress_highlight = True
+            option_list.highlighted = option_list.get_option_index(f"__grp__:{gid}")
+        except Exception:  # the header is gone (an emptied group)
+            pass
+        finally:
+            self._suppress_highlight = False
+
+    def _toggle_group(self, gid: str) -> None:
+        grouping = self.store.grouping
+        group = grouping.get(gid)
+        if group is None:
+            return
+        group.collapsed = not group.collapsed
+        self._save_grouping(grouping)
+        self._keep_header_highlighted(gid)
 
     def _update_row(self, sid: str) -> None:
         session = self.sessions.get(sid)
@@ -1248,6 +1501,8 @@ class CloudSessionsApp(App):
         option_list.add_options([Option(self._attention_row(s, width), id=s.id) for s in rows])
 
     def _render_header(self) -> None:
+        """Title, status and model, and what Claude is waiting on or last did. Repositories, the branch and
+        PRs live in the strip above the reply box."""
         header = self.main.query_one("#session-header", Static)
         session = self.sessions.get(self.selected or "")
         if session is None:
@@ -1255,37 +1510,32 @@ class CloudSessionsApp(App):
             header.update("")
             return
         self.sub_title = session.title or session.id
-        glyph, colour, label = describe_status(session, self.optimistic, self.frame, self._pr_state(session.id))
+        pr_state = self._pr_state(session.id)
+        glyph, colour, label = describe_status(session, self.optimistic, self.frame, pr_state)
         text = Text()
+        text.append(f"{glyph} ", style=colour)
         text.append(session.title or "Untitled session", style=f"bold {SAND}")
-        text.append("\n")
-        text.append(f"{glyph} {label}", style=colour)
+        text.append("\n  ")
+        text.append(label, style=colour)
         facts = [
             model_label(session.model) if session.model else "",
             label_for(EFFORTS, session.effort, session.effort).lower() if session.effort else "",
             label_for(PERMISSION_MODES, session.permission_mode).lower() if session.permission_mode else "",
         ]
-        if any(facts):
-            text.append("    " + " · ".join(f for f in facts if f), style=MUTED)
-        text.append("\n")
-        sources = session.sources or ([(session.repo, "")] if session.repo else [])
-        for index, (repo, revision) in enumerate(sources):
-            text.append("" if index == 0 else "   ")
-            text.append(repo or "repository unknown", style=link_style(f"https://github.com/{repo}", SAND) if repo else SAND)
-            if revision:
-                text.append(f" ⎇ {revision}", style=link_style(f"https://github.com/{repo}/tree/{revision}", MUTED))
-        if not sources:
-            text.append("no repository", style=MUTED)
-        env = next((e.name for e in self.envs if e.id == session.environment_id), "")
-        text.append("\n")
-        text.append(session.id, style=link_style(web_url(session.id), MUTED))
-        if env:
-            text.append(f"  ·  ☁ {env}", style=MUTED)
-        checkout = self._checkout(session)
-        text.append(
-            f"    teleports into {checkout}" if checkout else "    press c to set the local checkout for teleport",
-            style=MUTED,
-        )
+        updated = relative_time(session.last_activity)
+        if updated:
+            facts.append(f"updated {updated} ago" if updated[:-1].isdigit() else f"updated {updated}")
+        for fact in filter(None, facts):
+            text.append(" · ", style=MUTED)
+            text.append(fact, style=MUTED)
+        text.append(" · ", style=MUTED)
+        text.append("claude.ai ↗", style=link_style(web_url(session.id), MUTED))
+        if status_kind(session, self.optimistic, pr_state) == "needs_input" and session.needs_action:
+            text.append("\n  Waiting on you: ", style=AMBER)
+            text.append(" ".join(session.needs_action.split())[:240], style=AMBER)
+        elif session.summary:
+            text.append("\n  " + " ".join(session.summary.split())[:240], style=MUTED)
+        header.tooltip = session.id
         header.update(text)
 
     def _render_activity(self) -> None:
@@ -1299,6 +1549,9 @@ class CloudSessionsApp(App):
     def _tick(self) -> None:
         """Animate the spinners: working sessions' sidebar rows and the open conversation's status line."""
         self.frame += 1
+        self._ticks += 1
+        if self.echoes and self._ticks % 20 == 0:  # about every 2.5 s while a message of yours isn't recorded yet
+            self.refresh_events()
         working = [s for s in self.sessions.values() if status_kind(s, self.optimistic) == "working"]
         if not working:
             return
@@ -1406,12 +1659,16 @@ class CloudSessionsApp(App):
             self.selected = None
             self._show("home")
             self._render_header()
-            self._render_prbar()
+            self._render_context()
             return
         self._show("convo")
         if sid == self.selected:
             return
         self.selected = sid
+        self.board = TaskBoard()
+        self.echoes = []
+        self.changes_commit = None
+        self._pane_sig = {}
         self.rendered_keys = set()
         self.events_cursor = None
         self.events_error_for = None
@@ -1419,7 +1676,9 @@ class CloudSessionsApp(App):
         self.main.query_one("#transcript", VerticalScroll).remove_children()
         self._render_header()
         self._render_activity()
-        self._render_prbar()
+        self._render_context()
+        self._render_plan()
+        self._reload_panes()
         self.refresh_selected_pr()
         if sid in self.sessions and not self.api_ok:
             self._note(
@@ -1451,7 +1710,9 @@ class CloudSessionsApp(App):
     @on(OptionList.OptionSelected, "#sessions")
     def _chosen(self, event: OptionList.OptionSelected) -> None:
         sid = event.option.id
-        if sid == "__more__":
+        if sid and sid.startswith("__grp__:"):
+            self._toggle_group(sid.split(":", 1)[1])
+        elif sid == "__more__":
             self.visible_limit += PAGE
             self._render_list()
         elif sid == "__load__":
@@ -1546,6 +1807,16 @@ class CloudSessionsApp(App):
         what, i = chip.what, chip.index
         if what == "menu":
             self.action_session_menu()
+        elif what.startswith("toggle:"):
+            self.toggle_pane(what.split(":", 1)[1])
+        elif what.startswith("pane-close:"):
+            self.close_pane(what.split(":", 1)[1])
+        elif what == "side-max":
+            self.action_toggle_side_max()
+        elif what.startswith("target:"):
+            self.pick_target()
+        elif what == "pr":
+            self.action_pull_request()
         elif what == "env":
             options = [(e.id, e.name, "" if e.kind == "anthropic_cloud" else e.kind) for e in self.envs]
             note = "" if options else "No environments loaded yet."
@@ -1705,6 +1976,7 @@ class CloudSessionsApp(App):
         self.notify("Session started.")
         self._render_list()
         self._select(sid)
+        self._add_echo(prompt, "sent · waiting for the session to start")
         self.refresh_sessions()
 
     # ------------------------------------------------------------------ actions
@@ -1728,21 +2000,62 @@ class CloudSessionsApp(App):
         if not text or session is None:
             return
         event.input.value = ""
-        if not self.api_ok:
-            self._write_message(Message("local", "user", "text", text))
-        self.notify("Sending…", timeout=2)
-        self.send_message(session.id, text)
+        echo = self._add_echo(text, "sending…")
+        self.send_message(session.id, text, echo)
+
+    def _add_echo(self, text: str, status: str) -> Echo:
+        """Show a message you've sent right away, marked as not yet recorded."""
+        ctx = self._link_context()
+        body = Text()
+        for i, line in enumerate(text.splitlines() or [""]):
+            body.append("\n" if i else "")
+            body.append("▎ ", style=CLAY)
+            body.append_text(linkify_text(line, ctx, SAND))
+        note = Static(Text(f"  {status}", style=f"italic {MUTED}"), classes="note")
+        widgets = [Static(Text("You", style=f"bold {SAND}"), classes="who"), Static(body, classes="user"), note]
+        self._append(widgets)
+        echo = Echo(text, widgets, note)
+        self.echoes.append(echo)
+        return echo
+
+    def _set_echo_status(self, echo: Echo, status: str) -> None:
+        try:
+            echo.status.update(Text(f"  {status}", style=f"italic {MUTED}"))
+        except Exception:  # its conversation was closed in the meantime
+            pass
+
+    def _drop_echo(self, echo: Echo) -> None:
+        if echo in self.echoes:
+            self.echoes.remove(echo)
+        for widget in echo.widgets:
+            try:
+                widget.remove()
+            except Exception:
+                pass
+
+    def _reconcile_echo(self, message: Message) -> None:
+        """The server has recorded a message of yours: drop its stand-in, whose place the real one takes."""
+        if message.role != "user" or message.kind != "text":
+            return
+        wanted = same_text(message.text)
+        echo = next((e for e in self.echoes if same_text(e.text) == wanted), None)
+        if echo is not None:
+            self._drop_echo(echo)
 
     @background(group="send")
-    async def send_message(self, sid: str, text: str) -> None:
+    async def send_message(self, sid: str, text: str, echo: Echo | None = None) -> None:
         result = await asyncio.to_thread(claude_cli.send_followup, self.claude_bin, sid, text)
         if result.ok:
+            if echo is not None:
+                self._set_echo_status(echo, "sent · waiting for the session to take it in")
             self.notify("Sent to the cloud session.")
             self.optimistic[sid] = time.monotonic() + OPTIMISTIC_SECONDS
             self._render_activity()
             await asyncio.sleep(1.5)
             self.refresh_events()
             return
+        if echo is not None:
+            self._drop_echo(echo)  # it never went anywhere, so it isn't part of the conversation
         self.notify(f"Not sent: {result.error}", severity="error", timeout=12)
         composer = self.main.query_one("#composer", Input)
         if not composer.value:
@@ -1859,12 +2172,15 @@ class CloudSessionsApp(App):
         sidebar = self.main.query_one("#sessions", OptionList)
         if sidebar.has_focus and sidebar.highlighted is not None:
             option = sidebar.get_option_at_index(sidebar.highlighted)
-            if option.id and not option.id.startswith("__"):
+            if option.id and (option.id.startswith("__grp__:") or not option.id.startswith("__")):
                 return option.id
         return self.selected
 
     def action_session_menu(self) -> None:
         sid = self._menu_target()
+        if sid and sid.startswith("__grp__:"):
+            self.open_group_menu(sid.split(":", 1)[1])
+            return
         if sid is None or sid not in self.sessions:
             self.notify("Pick a session first.", severity="warning")
             return
@@ -1876,14 +2192,14 @@ class CloudSessionsApp(App):
         items: list[MenuItem | None] = [
             MenuItem("open", "Open in", submenu=True),
             None,
-            MenuItem("pin", "Pin", "p", enabled=False, note="unavailable"),
+            MenuItem("pin", "Unpin" if self.store.grouping.is_pinned(sid) else "Pin", "p"),
             MenuItem("read", "Mark as read", "u", enabled=server and session.unread),
             MenuItem("rename", "Rename", "r", enabled=server),
             None,
             MenuItem("share", "Share", enabled=server),
             MenuItem("copy", "Copy link", "c"),
             None,
-            MenuItem("group", "Move to group", submenu=True, enabled=False, note="unavailable"),
+            MenuItem("group", "Move to group", submenu=True),
             None,
             MenuItem("archive", "Archive", "a", enabled=server and not session.archived),
             MenuItem("delete", "Delete" if server else "Forget", "d", danger=True),
@@ -1898,6 +2214,13 @@ class CloudSessionsApp(App):
         title = session.title or session.id
         if choice == "open":
             self._open_in_menu(sid)
+        elif choice == "pin":
+            grouping = self.store.grouping
+            pinned = grouping.toggle_pin(sid)
+            self._save_grouping(grouping)
+            self.notify("Pinned." if pinned else "Unpinned.")
+        elif choice == "group":
+            self._group_menu(sid)
         elif choice == "read":
             self.mark_read_task(sid)
         elif choice == "rename":
@@ -1921,6 +2244,93 @@ class CloudSessionsApp(App):
                 ConfirmScreen("Delete this session?", message, "Delete", danger=True),
                 lambda yes: yes and self.delete_task(sid),
             )
+
+    def _group_menu(self, sid: str) -> None:
+        """Move a session into a group, a new one, or back out."""
+        grouping = self.store.grouping
+        current = grouping.group_of(sid)
+        items: list[MenuItem | None] = [
+            MenuItem(f"to:{g.id}", g.name, str(i), note="current" if current is g else "")
+            for i, g in enumerate(grouping.groups[:9], 1)
+        ]
+        if items:
+            items.append(None)
+        items.append(MenuItem("new", "New group…", str(min(len(grouping.groups) + 1, 9))))
+        if current is not None:
+            items.append(MenuItem("none", "Remove from group", "0"))
+        screen = MenuScreen("Move to group", items)
+
+        def chosen(choice: str | None) -> None:
+            if choice == "new":
+                form = FormScreen("New group", [("name", "Name", "")], "Create", "The session is moved into it.")
+                self.push_screen(form, lambda values: self._new_group(sid, values))
+            elif choice == "none":
+                self._move(sid, None)
+            elif choice and choice.startswith("to:"):
+                self._move(sid, choice[3:])
+
+        self.push_screen(screen, chosen)
+
+    def _move(self, sid: str, gid: str | None) -> None:
+        grouping = self.store.grouping
+        grouping.move(sid, gid)
+        self._save_grouping(grouping)
+        group = grouping.get(gid) if gid else None
+        self.notify(f"Moved to {group.name}." if group else "Moved out of its group.")
+
+    def _new_group(self, sid: str, values: dict | None) -> None:
+        name = (values or {}).get("name", "").strip()
+        if not name:
+            return
+        grouping = self.store.grouping
+        group = grouping.by_name(name) or grouping.new_group(name)  # a name that exists means that group
+        grouping.move(sid, group.id)
+        self._save_grouping(grouping)
+        self.notify(f"Moved to {group.name}.")
+
+    def open_group_menu(self, gid: str) -> None:
+        group = self.store.grouping.get(gid)
+        if group is None:
+            return
+        items: list[MenuItem | None] = [
+            MenuItem("toggle", "Expand" if group.collapsed else "Collapse", "c"),
+            MenuItem("rename", "Rename group", "r"),
+            None,
+            MenuItem("delete", "Delete group", "d", danger=True),
+        ]
+
+        def chosen(choice: str | None) -> None:
+            if choice == "toggle":
+                self._toggle_group(gid)
+            elif choice == "rename":
+                form = FormScreen("Rename group", [("name", "Name", group.name)], "Rename")
+                self.push_screen(form, lambda values: self._rename_group(gid, values))
+            elif choice == "delete":
+                members = sum(1 for sid in group.members if sid in self.sessions)
+                message = f"“{group.name}” is removed and its {members} sessions go back to Ungrouped. The sessions themselves aren't touched."
+                self.push_screen(
+                    ConfirmScreen("Delete this group?", message, "Delete group", danger=True),
+                    lambda yes: yes and self._delete_group(gid),
+                )
+
+        self.push_screen(MenuScreen(group.name, items), chosen)
+
+    def _rename_group(self, gid: str, values: dict | None) -> None:
+        name = (values or {}).get("name", "").strip()
+        grouping = self.store.grouping
+        existing = grouping.by_name(name)
+        if not name or (existing is not None and existing.id != gid):
+            if name:
+                self.notify(f"There's already a group called {name}.", severity="warning")
+            return
+        grouping.rename(gid, name)
+        self._save_grouping(grouping)
+
+    def _delete_group(self, gid: str) -> None:
+        grouping = self.store.grouping
+        grouping.delete(gid)
+        self._save_grouping(grouping)
+        self.notify("Group deleted.")
 
     def _open_in_menu(self, sid: str) -> None:
         session = self.sessions[sid]
@@ -2028,6 +2438,9 @@ class CloudSessionsApp(App):
         for table in (self.sessions, self.older, self.branches):
             table.pop(sid, None)
         self.store.remove_known(sid)
+        grouping = self.store.grouping
+        grouping.forget(sid)
+        self.store.save_grouping(grouping)
         if self.selected == sid:
             self._select(None)
         self.notify("Deleted.")
@@ -2045,8 +2458,14 @@ class CloudSessionsApp(App):
         sid: str | None = None
         if isinstance(widget, OptionList) and widget.id in {"sessions", "attention"}:
             line = event.screen_y - region.y + widget.scroll_offset.y
-            if 0 <= line < widget.option_count:
-                option = widget.get_option_at_index(line)
+            lines = getattr(widget, "_lines", None)  # rows can be several lines tall: map the line to its option
+            index = lines[line][0] if lines and 0 <= line < len(lines) else line
+            if 0 <= index < widget.option_count:
+                option = widget.get_option_at_index(index)
+                if option.id and option.id.startswith("__grp__:") and widget.id == "sessions":
+                    event.stop()
+                    self.open_group_menu(option.id.split(":", 1)[1])
+                    return
                 if option.id and not option.id.startswith("__"):
                     sid = option.id
         elif self.selected and any(a.id == "convo" for a in widget.ancestors_with_self):
@@ -2054,6 +2473,202 @@ class CloudSessionsApp(App):
         if sid in self.sessions:
             event.stop()
             self.open_menu(sid)
+
+    # ------------------------------------------------------------------ side panels
+
+    def action_toggle_changes(self) -> None:
+        self.toggle_pane("changes")
+
+    def action_toggle_files(self) -> None:
+        self.toggle_pane("files")
+
+    def action_toggle_plan(self) -> None:
+        self.toggle_pane("plan")
+
+    def action_toggle_side_max(self) -> None:
+        if any(self.side_open.values()):
+            self.side_max = not self.side_max
+            self._apply_side()
+
+    def toggle_pane(self, name: str) -> None:
+        if self.selected is None:
+            self.notify("Open a session first.", severity="warning")
+            return
+        self.side_open[name] = not self.side_open[name]
+        self._apply_side()
+        if self.side_open[name]:
+            self._load_pane(name, force=True)
+
+    def close_pane(self, name: str) -> None:
+        self.side_open[name] = False
+        self._apply_side()
+
+    def _apply_side(self) -> None:
+        opened = any(self.side_open.values())
+        if not opened:
+            self.side_max = False
+        side = self.main.query_one("#side")
+        side.display = opened
+        side.set_class(self.side_max, "max")
+        self.main.query_one("#convo-main").display = not (opened and self.side_max)
+        for name, is_open in self.side_open.items():
+            self.main.query_one(f"#pane-{name}").display = is_open
+        for chip in self.main.query("#header-row Chip").results(Chip):
+            if chip.what.startswith("toggle:"):
+                chip.set_class(self.side_open[chip.what.split(":", 1)[1]], "on")
+
+    def _targets(self) -> list[Target]:
+        session = self.sessions.get(self.selected or "")
+        if session is None:
+            return []
+        return targets_for(session.sources, self.branches.get(session.id, []))
+
+    def _target(self) -> Target | None:
+        targets = self._targets()
+        if not targets:
+            return None
+        index = self.target_idx.get(self.selected or "", 0)
+        return targets[min(index, len(targets) - 1)]
+
+    def _reload_panes(self) -> None:
+        for name, is_open in self.side_open.items():
+            if is_open:
+                self._load_pane(name)
+
+    def _load_pane(self, name: str, force: bool = False) -> None:
+        if name == "plan":
+            self._render_plan()
+        elif name == "changes":
+            self.load_changes(force)
+        else:
+            self.load_files(force)
+
+    def _render_plan(self) -> None:
+        done, total = self.board.counts
+        label = f"✓ {done}/{total}" if total else "✓"
+        for chip in self.main.query("#header-row Chip").results(Chip):
+            if chip.what == "toggle:plan":
+                chip.label = label
+        self.main.query_one("#pane-plan", PlanPane).show(self.board)
+
+    def pick_target(self) -> None:
+        targets = self._targets()
+        if len(targets) < 2:
+            self.notify("This session has one branch to compare." if targets else "No pushed branch or PR yet.", timeout=3)
+            return
+        options = [(str(i), t.label, f"PR #{t.pr.number}" if t.pr else "") for i, t in enumerate(targets)]
+        current = str(min(self.target_idx.get(self.selected or "", 0), len(targets) - 1))
+
+        def chosen(value: str | None) -> None:
+            if value is None or self.selected is None:
+                return
+            self.target_idx[self.selected] = int(value)
+            self.changes_commit = None
+            self._pane_sig = {}
+            self._reload_panes()
+
+        self.push_screen(ChoiceScreen("Compare", options, current), chosen)
+
+    def _no_target_message(self) -> str:
+        session = self.sessions.get(self.selected or "")
+        if session is not None and not session.from_server:
+            return "This session isn't loaded from claude.ai, so its branches aren't known."
+        return "No pushed branch or pull request for this session yet."
+
+    @background(exclusive=True, group="changes")
+    async def load_changes(self, force: bool = False) -> None:
+        sid = self.selected
+        pane = self.main.query_one("#pane-changes", ChangesPane)
+        target = self._target()
+        if target is None:
+            pane.show_message(self._no_target_message())
+            return
+        if not prinfo.gh_available():
+            pane.show_message("Changes need the gh CLI: install it and run `gh auth login`.")
+            return
+        cached = self.cmp_cache.get(target.key)
+        if cached is None or force or time.monotonic() - cached[0] > 45:
+            if cached is None:
+                pane.show_message("Loading the changes…")
+            comparison = await asyncio.to_thread(gh_compare, target.repo, target.base, target.head)
+            self.cmp_cache[target.key] = (time.monotonic(), comparison)
+        else:
+            comparison = cached[1]
+        if self.selected != sid or self._target() is None or self._target().key != target.key:
+            return
+        signature = (target.key, tuple((c.sha for c in comparison.commits)), tuple((f.path, f.additions, f.deletions) for f in comparison.files), comparison.error, self.changes_commit)
+        if self._pane_sig.get("changes") == signature and not force:
+            return  # nothing new: leave the reader's place in the tree and diff alone
+        self._pane_sig["changes"] = signature
+        pane.show_comparison(target, comparison, keep_commit=self.changes_commit)
+        if self.changes_commit:
+            await self._show_commit(target, self.changes_commit)
+
+    async def _show_commit(self, target: Target, sha: str) -> None:
+        pane = self.main.query_one("#pane-changes", ChangesPane)
+        key = (target.repo.lower(), sha)
+        if key not in self.commit_cache:
+            files, error = await asyncio.to_thread(gh_commit_files, target.repo, sha)
+            if error:
+                pane.show_message(f"Couldn't read that commit: {error}")
+                return
+            self.commit_cache[key] = files
+        pane.show_files(self.commit_cache[key])
+
+    def pick_commit(self, sha: str | None) -> None:
+        """A commit chosen in the Changes panel: show just its files, or all changes again."""
+        self.changes_commit = sha
+        target = self._target()
+        if target is None:
+            return
+        if sha is None:
+            cached = self.cmp_cache.get(target.key)
+            if cached:
+                self.main.query_one("#pane-changes", ChangesPane).show_files(cached[1].files)
+            return
+        self._commit_task(target, sha)
+
+    @background(exclusive=True, group="commit")
+    async def _commit_task(self, target: Target, sha: str) -> None:
+        await self._show_commit(target, sha)
+
+    @background(exclusive=True, group="files")
+    async def load_files(self, force: bool = False) -> None:
+        sid = self.selected
+        pane = self.main.query_one("#pane-files", FilesPane)
+        target = self._target()
+        if target is None:
+            pane.show_message(self._no_target_message())
+            return
+        if not prinfo.gh_available():
+            pane.show_message("Files need the gh CLI: install it and run `gh auth login`.")
+            return
+        key = (target.repo.lower(), target.head)
+        cached = self.tree_cache.get(key)
+        if cached and not force and time.monotonic() - cached[0] < 300:
+            if self._pane_sig.get("files") == key:
+                return
+            paths, truncated, error = cached[1], cached[2], cached[3]
+        else:
+            pane.show_message("Loading the files…")
+            paths, truncated, error = await asyncio.to_thread(gh_tree, target.repo, target.head)
+            self.tree_cache[key] = (time.monotonic(), paths, truncated, error)
+        if self.selected != sid:
+            return
+        self._pane_sig["files"] = key
+        pane.show_paths(target, paths, truncated, error)
+
+    def open_file(self, path: str) -> None:
+        target = self._target()
+        if target is not None:
+            self._open_file_task(target, path)
+
+    @background(exclusive=True, group="file")
+    async def _open_file_task(self, target: Target, path: str) -> None:
+        pane = self.main.query_one("#pane-files", FilesPane)
+        pane.show_file(path, "", "loading…")
+        text, error = await asyncio.to_thread(gh_file, target.repo, path, target.head)
+        pane.show_file(path, text, error, url=f"https://github.com/{target.repo}/blob/{target.head}/{path}")
 
     def action_pull_request(self) -> None:
         session = self._current()

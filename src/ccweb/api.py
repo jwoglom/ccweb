@@ -22,6 +22,7 @@ from . import __version__
 from .auth import AuthError, nudge_cli_refresh, read_access_token, read_org_uuid
 from .config import parse_endpoint
 from .prinfo import BranchStatus, parse_branch_status
+from .tasks import extract_task_ops
 
 USER_AGENT = f"ccweb/{__version__} (personal client)"
 
@@ -377,6 +378,7 @@ class EventPage:
     messages: list[Message]
     has_more: bool = False
     last_id: str | None = None
+    task_ops: list[dict] = field(default_factory=list)  # task-list calls in this page, for the Plan panel
 
 
 # --------------------------------------------------------------------------
@@ -479,7 +481,7 @@ class CloudApi:
         payload = await self.request("list_events", query=query, id=session_id)
         meta = payload if isinstance(payload, dict) else {}
         last_id = meta.get("last_id") if isinstance(meta.get("last_id"), str) else None
-        return EventPage(normalize_events(payload), meta.get("has_more") is True, last_id)
+        return EventPage(normalize_events(payload), meta.get("has_more") is True, last_id, extract_task_ops(payload))
 
     async def list_events(self, session_id: str) -> list[Message]:
         return (await self.list_events_page(session_id)).messages

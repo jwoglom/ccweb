@@ -74,17 +74,35 @@ The sidebar is ordered by last activity, newest first, as on the web. A filled d
 
 ## Pull requests, CI and diffs
 
-Under an open conversation's header, a PR bar lists the pull requests the session opened, and any branch it pushed that has no PR yet:
+Just above the reply box, as on the web, a strip shows what the session is working on: its environment and repositories (with the branch each started from), the branch Claude pushes to, and the pull requests it opened, or a pushed branch that has no PR yet:
 
 ```
-⎇ owner/repo#525  Draft  +323 −29  CI ✓8  approved  Thread-safe bolus progress reporting
+☁ Default   </> TandemKit ⎇ dev   </> Trio ⎇ dev
+⎇ claude/compassionate-bell-og9bfb
+⎇ owner/TandemKit#525  Draft  +323 −29  CI ✓8  approved  Thread-safe bolus progress reporting
 ```
+
+The header above the conversation stays short: the title, the status, the model, when it was last active, and either the question Claude is waiting on or its last summary.
+
+Each sidebar row has a second line with the same information in brief: `Draft #525 · CI running 5/8 · 12m`, `Merged #16 · 2h`, `2 commits pushed, no PR`, and, when there's no PR, the question you're being asked or the last summary. `CI passed`, `CI running`, `CI failed` and `CI failing` (something has failed and the rest is still going) are coloured green, amber and red. CI for the sidebar comes from one batched `gh` call per refresh, for live PRs only.
 
 State, size, and the review decision come from the same batched endpoint the web sidebar uses. The sidebar uses it too: a session you've already seen shows a PR icon instead of the hollow dot (gray for open or draft, purple for merged, red for closed), and a session with a live PR counts as ready for review on the home page. Unread still wins over the PR icon, as on the web.
 
-That endpoint leaves CI results empty, so check counts come from the `gh` CLI. Press `d` for the full view: the PR summary, every check (failures first), the changed files and the whole diff, colored. In that view `o` opens the PR on GitHub, `r` reloads and `Esc` closes. Without `gh` (install it and run `gh auth login`), the bar still shows state and size, and the view says what's missing. The diff is cut at 4,000 lines.
+That endpoint leaves CI results empty, so check counts come from the `gh` CLI. Press `D` (shift+d) for the PR summary: every check (failures first), the changed files and the whole diff, colored. In that view `o` opens the PR on GitHub, `r` reloads and `Esc` closes. Without `gh` (install it and run `gh auth login`), the strip still shows state and size, and the view says what's missing. The diff is cut at 4,000 lines.
 
 Both are looked up as the sessions refresh (every 30 seconds for the sidebar, every 15 for the open session), and only for your newest 40 sessions. A session that opened PRs in several repositories shows each one.
+
+## Side panels: Plan, Files and Changes
+
+Like the web's right-hand panel. Toggle them with `d`, `f` and `p`, or the `±`, `▤` and `✓` buttons beside the title (the `✓` shows progress, such as `✓ 5/8`). Any two or three can be open at once, stacked as on the web: Plan on top, then Files, then Changes. `z` (or `⤢`) expands the panel to fill the window and back, and `×` closes one.
+
+| Panel | Shows | Comes from |
+| --- | --- | --- |
+| **Changes** | The session's branch against the branch it started from (or its PR's base): a tree of changed files with `+/−` counts, the commits (pick one to see only its files, or **All changes**), and the selected file's diff with line numbers | `gh api …/compare` and `…/commits` |
+| **Files** | The repository at the session's branch, with a search box; Enter opens a file beside the tree | `gh api …/git/trees` and `…/contents` |
+| **Plan** | Claude's task list: done (struck through), in progress (with what it's doing now), and pending | Rebuilt from the conversation's `TaskCreate` and `TaskUpdate` calls (and the older `TodoWrite`), because the server doesn't expose the list |
+
+Changes and Files need the `gh` CLI, signed in with access to the repository; Plan needs nothing extra. A session that touched several repositories offers each as a comparison: click the branch name at the top of the panel. A session with no pushed branch or PR says so. Like the rest of the conversation, the text in the panels can be selected and copied.
 
 ## Session menu
 
@@ -93,16 +111,27 @@ Press `m` on a session, right-click it (in the sidebar, on the home list, or any
 | Item | Key | What it does |
 | --- | --- | --- |
 | Open in › | | claude.ai in the browser, a terminal (`claude --teleport`), or the session's PRs on GitHub |
-| Pin | `P` | Not available (see below) |
+| Pin / Unpin | `P` | Moves it to a Pinned section at the top of the sidebar (kept on this machine) |
 | Mark as read | `U` | Clears the unread dot on claude.ai too. Opening a session in ccweb doesn't mark it read |
 | Rename | `R` | Changes the title everywhere |
 | Share | | Shows who can see the session. Changing that is done on claude.ai |
 | Copy link | `C` | Copies `claude.ai/code/<id>` |
-| Move to group › | | Not available (see below) |
+| Move to group › | | Pick a group by number, make a **New group…**, or remove it from its group (kept on this machine) |
 | Archive | `A` | Asks first. ccweb can archive but not restore; the web can restore |
 | Delete | `D` | Asks first, and can't be undone. For a session you only added by link, it forgets it locally instead |
 
-Rename, mark read and archive are the calls the `claude` CLI itself makes. Delete uses the verb the server lists for sessions. **Pin and groups aren't offered** because that state isn't on the session objects or on any route ccweb can reach; they appear to live in account-level settings behind claude.ai's browser check. To add them, someone needs the request the web sends when you pin or move a session.
+Rename, mark read and archive are the calls the `claude` CLI itself makes, and they change the session on claude.ai. Delete uses the verb the server lists for sessions. Pin and Move to group don't touch claude.ai at all; see below.
+
+## Groups and pins
+
+The sidebar groups sessions the way the web's does: a **Pinned** section on top, then each group (`▾ Name  3`), then **Ungrouped**. Inside a group, newest activity comes first. Empty groups are hidden, and a search looks inside collapsed ones.
+
+These are **kept on this machine, not shared with the web**. claude.ai stores your groups and pins in a settings document whose endpoint answers "This endpoint does not accept OAuth access tokens", so the Claude Code login ccweb uses can't read or change them. A group made here won't appear on the web, and the web's groups don't appear here.
+
+- Make or fill a group: `m` on a session, then **Move to group** (or **New group…**).
+- On a group header: `Enter` collapses it, and right-click or `m` opens its menu (Collapse, Rename group, Delete group). Deleting a group only returns its sessions to Ungrouped.
+- `g` switches between the grouped view and one flat list.
+- Stored in the state file as group names and session IDs, nothing else. Deleting a session also drops it from any group and from the pins.
 
 ## Links, selecting and copying
 
@@ -120,11 +149,13 @@ While the prompt box has focus (the home page opens that way), letters are typed
 | `Enter` | Open the session and jump to the reply box |
 | `Esc` | Back to the session list |
 | `n` | Home page: start a new session |
-| `m` | Session menu (rename, archive, delete, and the rest) |
+| `m` | Session menu (rename, pin, group, archive, delete, and the rest); on a group header, the group's menu |
+| `g` | Show groups or one flat list |
 | `i` | Add a session by its claude.ai/code link |
 | `o` | Open on claude.ai |
 | `y` | Copy link |
-| `d` | Pull request: checks, files and diff |
+| `d` `f` `p` | Open the Changes, Files and Plan panels (again to close); `z` expands the panel |
+| `D` | Pull request summary and CI checks |
 | `t` | Teleport into the local checkout |
 | `c` | Set the local checkout used for teleport |
 | `/` | Search |
@@ -139,6 +170,10 @@ From a script:
 - `ccweb ls` prints sessions as tab-separated lines.
 - `ccweb send <id> "message"` sends a reply. If you leave out the message, it reads stdin.
 
+## Replying
+
+A message you send shows in the conversation straight away, marked `sending…` and then `sent · waiting for the session to take it in`. A cloud session that's idle has to wake up before the server records your message, which can take a while, so without this it can look as though nothing happened. When the server's own copy arrives, it replaces yours. If the send fails, the message is removed again and your text goes back in the box. The first prompt of a new session is shown the same way.
+
 ## Credentials and privacy
 
 - ccweb reads your existing Claude Code login each time it needs it: from the macOS Keychain item `Claude Code-credentials`, or from `~/.claude/.credentials.json` on Linux.
@@ -146,7 +181,7 @@ From a script:
 - macOS may ask once whether to allow Keychain access.
 - When the token has expired, ccweb runs `claude auth status` so the CLI refreshes it, then reads it again. ccweb never runs its own sign-in.
 - `CCWEB_ACCESS_TOKEN` overrides the token for testing. Don't put it in shell startup files.
-- Conversations are never written to disk. The local state file (`~/.local/share/ccweb/state.json`, owner-only) holds only session IDs you added, checkout paths, and your last new-session settings (environment, repositories and branches, mode, model, effort).
+- Conversations are never written to disk. The local state file (`~/.local/share/ccweb/state.json`, owner-only) holds only session IDs you added, checkout paths, your last new-session settings (environment, repositories and branches, mode, model, effort), and your sidebar groups and pins (names and session IDs).
 - The greeting reads your first name from the local `~/.claude.json`. Nothing is sent anywhere for it.
 - Requests identify themselves honestly as `ccweb/0.1` and don't impersonate the CLI.
 

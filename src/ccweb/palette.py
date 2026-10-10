@@ -1,0 +1,11 @@
+"""The app's colours."""
+
+CLAY = "#d4835f"
+SAND = "#e8e4dc"
+MUTED = "#8f897f"
+AMBER = "#e0b354"
+SAGE = "#8db580"
+BRICK = "#e06c5f"
+BLUE = "#6f9be8"
+PURPLE = "#a78bfa"
+HUNK = "#6fb3c9"

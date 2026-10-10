@@ -237,6 +237,47 @@ def gh_details(url: str) -> Details:
     )
 
 
+_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
+_ROLLUP = (
+    "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { __typename "
+    "... on CheckRun { name status conclusion detailsUrl } ... on StatusContext { context state targetUrl } } } } } } }"
+)
+
+
+def ref_key(repo: str, number: int) -> tuple[str, int]:
+    return (repo.lower(), number)
+
+
+def gh_checks_batch(refs: list[tuple[str, int]], group_size: int = 20) -> dict[tuple[str, int], list[Check]]:
+    """CI checks for many PRs in one GraphQL call per group, keyed by ref_key. Anything gh can't read is left out."""
+    out: dict[tuple[str, int], list[Check]] = {}
+    if not gh_available():
+        return out
+    wanted = [(repo, number) for repo, number in dict.fromkeys(refs) if _REPO_RE.fullmatch(repo)]
+    for start in range(0, len(wanted), group_size):
+        group = wanted[start : start + group_size]
+        fields = " ".join(
+            f'p{i}: repository(owner: "{repo.split("/")[0]}", name: "{repo.split("/")[1]}") '
+            f"{{ pullRequest(number: {number}) {{ {_ROLLUP} }} }}"
+            for i, (repo, number) in enumerate(group)
+        )
+        try:
+            proc = subprocess.run(
+                ["gh", "api", "graphql", "-f", f"query=query {{ {fields} }}"], capture_output=True, text=True, timeout=45
+            )
+            data = (json.loads(proc.stdout) or {}).get("data") or {}  # partial results arrive with errors too
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            continue
+        for i, (repo, number) in enumerate(group):
+            try:
+                node = data[f"p{i}"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                nodes = node["contexts"]["nodes"]
+            except (KeyError, IndexError, TypeError):
+                continue  # not readable, or the PR has no CI
+            out[ref_key(repo, number)] = [c for c in map(parse_check, nodes) if c is not None]
+    return out
+
+
 def gh_diff(url: str, max_lines: int = 4000) -> tuple[str, str]:
     """(diff text, error). Long diffs are cut at max_lines with a note."""
     ok, out = _gh(["pr", "diff", url, "--color", "never"], timeout=60)

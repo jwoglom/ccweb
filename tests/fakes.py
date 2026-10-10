@@ -33,7 +33,8 @@ SESSIONS = {
                     {"type": "git_repository", "url": "https://github.com/example-org/other-repo"},
                 ],
                 "effort_level": "medium",
-                "outcomes": [{"type": "git_repository", "git_info": {"branches": ["claude/fix-flaky-test"]}}],
+                "outcomes": [{"type": "git_repository",
+                              "git_info": {"type": "github", "repo": "example-org/example-repo", "branches": ["claude/fix-flaky-test"]}}],
             },
         },
         {
@@ -141,6 +142,30 @@ EVENTS = {
 }
 
 
+def _plan_events():
+    def use(n, name, args):
+        return {"uuid": f"t{n}", "type": "assistant", "created_at": f"2026-10-10T12:00:{n:02d}Z",
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "id": f"tu{n}", "name": name, "input": args}]}}
+
+    def result(n, text):
+        return {"uuid": f"r{n}", "type": "user", "created_at": f"2026-10-10T12:00:{n:02d}Z",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"tu{n}", "content": text}]}}
+
+    return [
+        use(1, "TaskCreate", {"subject": "Write the parser", "description": "read the doc", "activeForm": "Writing the parser"}),
+        result(1, "Task #1 created successfully: Write the parser"),
+        use(2, "TaskCreate", {"subject": "Add tests", "description": "cover the edge cases", "activeForm": "Adding tests"}),
+        result(2, "Task #2 created successfully: Add tests"),
+        use(3, "TaskCreate", {"subject": "Ship it", "description": "", "activeForm": "Shipping"}),
+        result(3, "Task #3 created successfully: Ship it"),
+        use(4, "TaskUpdate", {"taskId": "1", "status": "completed"}),
+        use(5, "TaskUpdate", {"taskId": "2", "status": "in_progress"}),
+    ]
+
+
+EVENTS_PLAN = {"data": _plan_events(), "has_more": False}
+
+
 class FakeServer:
     def __init__(self):
         self.requests: list[dict] = []
@@ -150,6 +175,7 @@ class FakeServer:
         self.titles: dict[str, str] = {}
         self.archived: set[str] = set()
         self.deleted: set[str] = set()
+        self.extra_events: list[dict] = []  # appended to a conversation once the "server" records them
 
         def norm(sid):  # the legacy cse_ form and session_ name the same session
             return "session_" + sid[4:] if sid.startswith("cse_") else sid
@@ -189,7 +215,10 @@ class FakeServer:
                 if url.path == "/v1/environment_providers":
                     return self._send(200, ENVIRONMENTS)
                 if url.path.startswith("/v1/sessions/") and url.path.endswith("/events"):
-                    return self._send(200, {"data": [], "has_more": False} if "after_id" in query else EVENTS)
+                    if "after_id" in query:
+                        return self._send(200, {"data": [], "has_more": False})
+                    base = EVENTS_PLAN if "session_01ReviewGGGGGGGG" in url.path else EVENTS
+                    return self._send(200, {**base, "data": base["data"] + outer.extra_events})
                 if url.path.startswith("/v1/sessions/"):
                     sid = url.path.rsplit("/", 1)[-1]
                     match = next((s for s in sessions_now(SESSIONS)["data"] if norm(s["id"]) == sid), None)

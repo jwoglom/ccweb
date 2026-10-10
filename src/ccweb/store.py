@@ -18,7 +18,7 @@ from .config import data_dir
 class Store:
     def __init__(self, path: Path | None = None):
         self.path = path or data_dir() / "state.json"
-        self.data: dict = {"version": 1, "known": {}, "checkouts": {}, "prefs": {}}
+        self.data: dict = {"version": 1, "known": {}, "checkouts": {}, "prefs": {}, "groups": None}
         self.load()
 
     def load(self) -> None:
@@ -30,6 +30,7 @@ class Store:
             self.data["known"] = dict(loaded.get("known") or {})
             self.data["checkouts"] = dict(loaded.get("checkouts") or {})
             self.data["prefs"] = dict(loaded.get("prefs") or {})
+            self.data["groups"] = loaded.get("groups") if isinstance(loaded.get("groups"), dict) else None
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,4 +72,16 @@ class Store:
 
     def set_prefs(self, **values) -> None:
         self.data["prefs"].update(values)
+        self.save()
+
+    @property
+    def grouping(self):
+        """Sidebar groups and pins kept on this machine (see groups.py). A fresh copy each time:
+        change it, then pass it to save_grouping."""
+        from .groups import Grouping
+
+        return Grouping.from_json(self.data["groups"])
+
+    def save_grouping(self, grouping) -> None:
+        self.data["groups"] = grouping.to_json()
         self.save()
