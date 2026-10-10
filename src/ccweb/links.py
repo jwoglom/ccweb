@@ -1,6 +1,6 @@
 """Turn text that looks like a link into something clickable.
 
-Links carry two things: a terminal hyperlink (OSC 8), which terminals such as iTerm2 and WezTerm
+Links carry two things: a terminal hyperlink (OSC 8), which terminals such as iTerm2
 open on Cmd-click, and a click action for the app, which works in terminals that hand clicks to
 the app instead of acting on the hyperlink. Either way the URL is only ever opened by a click.
 """

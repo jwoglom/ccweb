@@ -1636,7 +1636,7 @@ class CloudSessionsApp(App):
         self.action_open_link(event.href)
 
     def copy_to_clipboard(self, text: str) -> None:
-        """OSC 52 reaches the clipboard in iTerm2, kitty, WezTerm and others, but not Terminal.app or tmux
+        """OSC 52 reaches the clipboard in iTerm2, kitty and others, but not Terminal.app or tmux
         by default, so also hand the text to the system clipboard tool when there is one."""
         super().copy_to_clipboard(text)
         if self.is_headless:

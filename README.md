@@ -8,14 +8,16 @@ A personal terminal client for your Claude Code cloud sessions, the ones at clau
 
 | Feature | How | Status |
 | --- | --- | --- |
-| Session list, status, repo | `GET /v1/sessions` | Undocumented; check with `ccweb probe` |
-| Conversation | `GET /v1/sessions/{id}/events` | Undocumented; check with `ccweb probe` |
+| Session list, status, repo | `GET /v1/sessions` | Undocumented; confirmed working. `ccweb probe` re-checks it |
+| Conversation | `GET /v1/sessions/{id}/events` | Undocumented; confirmed working. `ccweb probe` re-checks it |
 | Reply | `claude -p --cloud <id> --output-format json` (message on stdin) | Documented |
 | Environments | `GET /v1/environment_providers` | Undocumented |
-| New session | `POST /v1/sessions`, the request `claude --cloud` itself sends | Undocumented, not yet confirmed end to end |
+| New session | `POST /v1/sessions`, the request `claude --cloud` itself sends | Undocumented; confirmed working |
 | Teleport | `claude --teleport <id>` from your checkout | Documented |
 | PRs, branches | `POST /v1/code/github/get-batch-branch-status`, the call claude.ai's own sidebar makes | Undocumented |
 | CI checks, files, diff | `gh pr view` and `gh pr diff`, when the `gh` CLI is installed and signed in | Optional |
+| Changes and Files panels | `gh api` compare, commits, git trees and contents, when `gh` is installed and signed in | Optional |
+| Plan panel | The conversation's `TaskCreate` / `TaskUpdate` calls, replayed | Derived from the events above |
 | Working indicator | `status_bucket` and `session_status`; the open session is re-read every few seconds | Undocumented |
 | Open on web, copy link | `https://claude.ai/code/<id>` | — |
 
@@ -70,7 +72,7 @@ With nothing saved, the form starts from your most recent session's environment 
 
 The sidebar is ordered by last activity, newest first, as on the web. A filled dot means unread (amber when Claude is asking you something, blue otherwise) and a hollow one means seen. A spinner means Claude is working, and an open conversation shows "Claude is working…" under the transcript.
 
-**Creating sessions is unconfirmed end to end.** The request is modeled on what the `claude` CLI sends, and the form, payload and error handling are covered by tests. Only a real session can confirm the server accepts it. If it's rejected, the server's message appears in a notification and your prompt stays in the box.
+Creating sessions uses the request the `claude` CLI itself sends, and has been confirmed to work against a real account. Like the other undocumented calls, it could change without notice. If the server ever rejects it, its message appears in a notification and your prompt stays in the box.
 
 ## Pull requests, CI and diffs
 
@@ -135,7 +137,7 @@ These are **kept on this machine, not shared with the web**. claude.ai stores yo
 
 ## Links, selecting and copying
 
-Text that looks like a link is clickable: web URLs, `owner/repo#123`, and a bare `#123` when the session makes clear which repository it means (its PR's, or its only repository). Repository names, branches, the session ID and the PR bar are links too. A click opens it. That works in any terminal. Terminals that handle hyperlinks themselves, such as iTerm2 and WezTerm, also open them on Cmd-click, because the links are real terminal hyperlinks as well. Only `http`, `https` and `mailto` links are ever opened.
+Text that looks like a link is clickable: web URLs, `owner/repo#123`, and a bare `#123` when the session makes clear which repository it means (its PR's, or its only repository). Repository names, branches, the session ID and the PR bar are links too. A click opens it. That works in any terminal. Terminals that handle hyperlinks themselves, such as iTerm2, also open them on Cmd-click, because the links are real terminal hyperlinks as well. Only `http`, `https` and `mailto` links are ever opened.
 
 Drag to select text anywhere in a conversation, the PR header or the diff, then press `Ctrl+C` to copy. A click that ends a drag doesn't open a link. Copying uses the terminal's clipboard support and also `pbcopy`, `wl-copy` or `xclip` when present, so it works in Terminal.app too.
 
@@ -187,7 +189,7 @@ A message you send shows in the conversation straight away, marked `sending…` 
 
 ## Before you rely on it
 
-Anthropic's terms say Claude.ai sign-in is meant for ordinary use of Claude Code and Anthropic's own apps, and that developers may not collect or intermediate Claude.ai credentials. Using your own login from your own client is at your own account's risk. Keep it personal: don't publish it as a tool for others or put it in an organization's public repos.
+Anthropic's terms say Claude.ai sign-in is meant for ordinary use of Claude Code and Anthropic's own apps, and that developers may not collect or intermediate Claude.ai credentials. Using your own login from your own client is at your own account's risk.
 
 ## Develop
 
