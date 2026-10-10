@@ -24,6 +24,13 @@ DEFAULTS: dict[str, Any] = {
         "list_environments": "GET /v1/environment_providers",
         "create_session": "POST /v1/sessions",
         "branch_status": "POST /v1/code/github/get-batch-branch-status",
+        # What the web's session menu does. Rename, mark read and archive are the calls the claude CLI makes;
+        # delete is the verb the server lists for the session resource.
+        "rename_session": "PUT /v1/code/sessions/{id}",
+        "mark_read": "POST /v1/code/sessions/{id}/mark_read",
+        "archive_session": "POST /v1/code/sessions/{id}/archive",
+        "delete_session": "DELETE /v1/sessions/{id}",
+        "share_status": "GET /v1/code/sessions/{id}/share",
         "timeout_seconds": 20,
     },
     "poll": {"sessions_seconds": 30, "events_seconds": 5},

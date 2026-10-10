@@ -452,7 +452,9 @@ class CloudApi:
         if status >= 400:
             raise ApiError(status, method, path, _error_detail(body))
         if isinstance(body, str):
-            raise ApiError(status, method, path, "response wasn't JSON")
+            if body.strip():
+                raise ApiError(status, method, path, "response wasn't JSON")
+            return {}  # actions such as delete and mark-read answer with an empty body
         return body
 
     async def list_sessions_page(self, after_id: str | None = None) -> SessionPage:
@@ -520,6 +522,24 @@ class CloudApi:
                 for owner in owners:
                     result[owner].append(status)
         return result
+
+    async def rename_session(self, session_id: str, title: str) -> None:
+        await self.request("rename_session", body={"title": title}, id=session_id)
+
+    async def mark_read(self, session_id: str) -> None:
+        await self.request("mark_read", body={}, id=session_id)
+
+    async def archive_session(self, session_id: str) -> None:
+        status, body, method, path = await self.raw("archive_session", body={}, id=session_id)
+        if status >= 400 and status != 409:  # 409 means it was already archived
+            raise ApiError(status, method, path, _error_detail(body))
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.request("delete_session", id=session_id)
+
+    async def share_status(self, session_id: str) -> dict:
+        payload = await self.request("share_status", id=session_id)
+        return payload if isinstance(payload, dict) else {}
 
     async def create_session(self, body: dict) -> str:
         """Create a cloud session; returns its ID. The request body mirrors what `claude --cloud` sends."""

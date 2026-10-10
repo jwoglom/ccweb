@@ -13,18 +13,21 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from dataclasses import dataclass
+
 from rich.cells import cell_len
-from rich.markdown import Markdown
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, ContentSwitcher, Footer, Input, Label, OptionList, RichLog, Static
+from textual.widgets import Button, ContentSwitcher, Footer, Input, Label, Markdown, OptionList, Static
 from textual.widgets.option_list import Option
+
+import subprocess
 
 from . import claude_cli, gitinfo, prinfo
 from .api import (
@@ -39,6 +42,7 @@ from .api import (
     parse_session_ref,
     web_url,
 )
+from .links import LinkContext, is_openable, link_style, linkify_markdown, linkify_text
 from .prinfo import BranchStatus, Details, PullRequest, best_pr_state, check_counts, relevant
 from .store import Store
 
@@ -219,13 +223,13 @@ def pr_line(status: BranchStatus, details: Details | None = None) -> Text:
     pr = status.pr
     if pr is None:
         line.append("⎇ ", style=MUTED)
-        line.append(f"{status.repo} {status.branch}", style=SAND)
+        line.append(f"{status.repo} {status.branch}", style=link_style(f"https://github.com/{status.repo}/tree/{status.branch}", SAND))
         noun = "commit" if status.commits == 1 else "commits"
         line.append(f"  {status.commits} {noun} pushed, no PR yet", style=MUTED)
         return line
     colour = PR_COLOURS.get(pr.state, MUTED)
     line.append("⎇ ", style=colour)
-    line.append(pr.label, style=f"bold {SAND}")
+    line.append(pr.label, style=link_style(pr.url, f"bold {SAND}") if pr.url else f"bold {SAND}")
     line.append(f"  {pr.state.capitalize()}", style=colour)
     if pr.additions or pr.deletions:
         line.append("  ")
@@ -361,8 +365,155 @@ class ChoiceScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+@dataclass
+class MenuItem:
+    id: str
+    label: str
+    key: str = ""  # shortcut letter, shown on the right and active while the menu is open
+    enabled: bool = True
+    submenu: bool = False
+    danger: bool = False
+    note: str = ""
+
+
+class MenuScreen(ModalScreen[str | None]):
+    """The web's session menu: a list of actions, each with an optional single-key shortcut."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, heading: str, items: list[MenuItem | None]):
+        """None in items is a divider."""
+        super().__init__()
+        self.heading, self.items = heading, items
+
+    def compose(self) -> ComposeResult:
+        width = 40
+        rows: list = []
+        for item in self.items:
+            if item is None:
+                rows.append(Option(Text("─" * width, style="#4a4742"), disabled=True))
+                continue
+            tail = "›" if item.submenu else item.key.upper()
+            text = Text(no_wrap=True, overflow="ellipsis")
+            style = BRICK if item.danger else (SAND if item.enabled else MUTED)
+            text.append(item.label, style=style)
+            if item.note:
+                text.append(f"  {item.note}", style=MUTED)
+            pad = max(1, width - cell_len(text.plain) - cell_len(tail))
+            text.append(" " * pad + tail, style=MUTED)
+            rows.append(Option(text, id=item.id, disabled=not item.enabled))
+        with Vertical(id="menu"):
+            yield Label(self.heading, id="menu-heading")
+            yield OptionList(*rows, id="menu-items")
+
+    def on_mount(self) -> None:
+        options = self.query_one("#menu-items", OptionList)
+        options.highlighted = next((i for i, o in enumerate(options.options) if not o.disabled and o.id), None)
+        options.focus()
+
+    @on(OptionList.OptionSelected, "#menu-items")
+    def _picked(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def on_key(self, event: events.Key) -> None:
+        if len(event.key) == 1:
+            for item in self.items:
+                if item and item.key and item.enabled and item.key.lower() == event.key.lower():
+                    event.stop()
+                    self.dismiss(item.id)
+                    return
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Ask before something that can't be undone from here."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, heading: str, message: str, confirm: str, danger: bool = False):
+        super().__init__()
+        self.heading, self.message, self.confirm, self.danger = heading, message, confirm, danger
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="form"):
+            yield Label(self.heading, id="form-heading")
+            yield Static(self.message, id="form-note")
+            with Horizontal(id="form-buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button(self.confirm, variant="error" if self.danger else "primary", id="confirm")
+
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()  # the safe answer is the default
+
+    @on(Button.Pressed, "#confirm")
+    def _yes(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+VISIBILITY = {
+    "private": "Only you",
+    "org_only": "Everyone in your organization",
+    "org": "Everyone in your organization",
+    "public": "Anyone with the link",
+}
+
+
+class ShareScreen(ModalScreen[str | None]):
+    """Who can see a session. Changing it happens on claude.ai; this shows where it stands."""
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, session: Session):
+        super().__init__()
+        self.session = session
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="form"):
+            yield Label("Share", id="form-heading")
+            yield Static("Checking…", id="share-state")
+            with Horizontal(id="form-buttons"):
+                yield Button("Copy link", id="copy")
+                yield Button("Open on claude.ai", id="open", variant="primary")
+                yield Button("Close", id="close")
+
+    def show(self, status: dict | None, error: str = "") -> None:
+        box = self.query_one("#share-state", Static)
+        if status is None:
+            box.update(Text(f"Couldn't read the sharing settings: {error}", style=MUTED))
+            return
+        visibility = str(status.get("effective_visibility") or "")
+        text = Text()
+        text.append("Visible to: ", style=MUTED)
+        text.append(VISIBILITY.get(visibility, visibility or "unknown"), style=f"bold {SAND}")
+        if visibility == "private":
+            options = VISIBILITY.get(str(status.get("prospective_visibility_type") or ""), "")
+            if options:
+                text.append(f"\nIf you share it, it goes to: {options}", style=MUTED)
+        text.append("\nSharing is changed on claude.ai. The link below only works for people who can already see it.", style=MUTED)
+        box.update(text)
+
+    @on(Button.Pressed, "#copy")
+    def _copy(self) -> None:
+        self.dismiss("copy")
+
+    @on(Button.Pressed, "#open")
+    def _open(self) -> None:
+        self.dismiss("open")
+
+    @on(Button.Pressed, "#close")
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class PullRequestScreen(ModalScreen[None]):
-    """A PR's summary, CI checks, changed files and diff. The last three come from the gh CLI."""
+    """A PR's summary, CI checks, changed files and diff, as plain selectable text.
+    The checks, files and diff come from the gh CLI."""
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
@@ -381,12 +532,16 @@ class PullRequestScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="prscreen"):
-            yield RichLog(id="pr-log", wrap=False, markup=False, highlight=False, auto_scroll=False)
-            yield Static("o opens the PR · r reloads · esc closes", id="pr-hint")
+            with ScrollableContainer(id="pr-scroll"):
+                yield Static(id="pr-summary")
+                yield Static(id="pr-checks")
+                yield Static(id="pr-files")
+                yield Static(id="pr-diff")
+            yield Static("drag to select, ctrl+c copies · o opens the PR · r reloads · esc closes", id="pr-hint")
 
     def on_mount(self) -> None:
         self._paint()
-        self.query_one("#pr-log", RichLog).focus()
+        self.query_one("#pr-scroll", ScrollableContainer).focus()
         if self.busy:
             self._load()
 
@@ -401,82 +556,96 @@ class PullRequestScreen(ModalScreen[None]):
         self._paint()
 
     def _paint(self) -> None:
-        log = self.query_one("#pr-log", RichLog)
-        log.clear()
         pr, details = self.pr, self.details
         colour = PR_COLOURS.get(pr.state, MUTED)
-        log.write(Text.assemble(("⎇ ", colour), (pr.label, f"bold {SAND}"), (f"  {pr.state.capitalize()}", colour)))
+        summary = Text(no_wrap=True)
+        summary.append("⎇ ", style=colour)
+        summary.append(pr.label, style=f"bold {SAND}")
+        summary.append(f"  {pr.state.capitalize()}\n", style=colour)
         if pr.title:
-            log.write(Text(pr.title, style=f"bold {SAND}"))
+            summary.append(f"{pr.title}\n", style=f"bold {SAND}")
         facts = [f"+{pr.additions} −{pr.deletions}", f"{pr.commits} commit{'s' if pr.commits != 1 else ''}"]
         if pr.base:
             facts.append(f"into {pr.base}")
-        review = (details.review if details and details.review else pr.review)
+        review = details.review if details and details.review else pr.review
         if review in REVIEW_LABELS:
             facts.append(REVIEW_LABELS[review][0])
         if details and details.mergeable and details.mergeable != "UNKNOWN":
             facts.append(details.mergeable.lower())
-        log.write(Text("  ·  ".join(facts), style=MUTED))
-        log.write(Text(pr.url, style=MUTED))
-        log.write(Text(""))
+        summary.append("  ·  ".join(facts) + "\n", style=MUTED)
+        if pr.url:
+            summary.append(pr.url, style=link_style(pr.url, MUTED))
+        self.query_one("#pr-summary", Static).update(summary)
 
-        checks = details.checks if details and details.checks else pr.checks
-        log.write(Text("Checks", style=f"bold {CLAY}"))
-        if checks:
+        checks = Text(no_wrap=True)
+        checks.append("\nChecks\n", style=f"bold {CLAY}")
+        found = details.checks if details and details.checks else pr.checks
+        if found:
             order = {"failure": 0, "pending": 1, "success": 2, "skipped": 3}
-            for check in sorted(checks, key=lambda c: (order.get(c.state, 4), c.name)):
+            for check in sorted(found, key=lambda c: (order.get(c.state, 4), c.name)):
                 glyph, glyph_colour = CHECK_GLYPHS[check.state]
-                log.write(Text.assemble((f"  {glyph} ", glyph_colour), (check.name, SAND), (f"  {check.state}", MUTED)))
+                checks.append(f"  {glyph} ", style=glyph_colour)
+                checks.append(check.name, style=link_style(check.url, SAND) if check.url else SAND)
+                checks.append(f"  {check.state}\n", style=MUTED)
         elif not prinfo.gh_available():
-            log.write(Text("  CI results need the gh CLI: install it and run `gh auth login`.", style=MUTED))
+            checks.append("  CI results need the gh CLI: install it and run `gh auth login`.\n", style=MUTED)
         elif details and details.error:
-            log.write(Text(f"  Couldn't read checks: {details.error}", style=MUTED))
+            checks.append(f"  Couldn't read checks: {details.error}\n", style=MUTED)
         elif self.busy and details is None:
-            log.write(Text("  Loading…", style=MUTED))
+            checks.append("  Loading…\n", style=MUTED)
         else:
-            log.write(Text("  No checks reported.", style=MUTED))
-        log.write(Text(""))
+            checks.append("  No checks reported.\n", style=MUTED)
+        self.query_one("#pr-checks", Static).update(checks)
 
+        files = Text(no_wrap=True)
         if details and details.files:
-            log.write(Text(f"Files changed ({len(details.files)})", style=f"bold {CLAY}"))
+            files.append(f"\nFiles changed ({len(details.files)})\n", style=f"bold {CLAY}")
             for path, added, removed in details.files:
-                log.write(Text.assemble((f"  +{added:<5}", SAGE), (f"−{removed:<5}", BRICK), (path, SAND)))
-            log.write(Text(""))
+                files.append(f"  +{added:<5}", style=SAGE)
+                files.append(f"−{removed:<5}", style=BRICK)
+                files.append(f"{path}\n", style=SAND)
+        self.query_one("#pr-files", Static).update(files)
 
-        log.write(Text("Diff", style=f"bold {CLAY}"))
+        diff = Text(no_wrap=True)
+        diff.append("\nDiff\n", style=f"bold {CLAY}")
         if self.diff:
             for line in self.diff.splitlines():
-                log.write(self._style_diff_line(line))
+                diff.append(line + "\n", style=self._diff_style(line))
         elif self.diff_error:
-            log.write(Text(f"  Couldn't read the diff: {self.diff_error}", style=MUTED))
+            diff.append(f"  Couldn't read the diff: {self.diff_error}\n", style=MUTED)
         elif not prinfo.gh_available():
-            log.write(Text("  The diff needs the gh CLI: install it and run `gh auth login`.", style=MUTED))
+            diff.append("  The diff needs the gh CLI: install it and run `gh auth login`.\n", style=MUTED)
         elif self.busy:
-            log.write(Text("  Loading…", style=MUTED))
+            diff.append("  Loading…\n", style=MUTED)
         else:
-            log.write(Text("  No changes.", style=MUTED))
-        log.call_after_refresh(log.scroll_home, animate=False)  # after layout, so it lands on the summary
+            diff.append("  No changes.\n", style=MUTED)
+        self.query_one("#pr-diff", Static).update(diff)
+        self.query_one("#pr-scroll", ScrollableContainer).scroll_home(animate=False)
 
     @staticmethod
-    def _style_diff_line(line: str) -> Text:
+    def _diff_style(line: str) -> str:
         if line.startswith(("diff --git", "index ", "+++", "---", "new file", "deleted file", "similarity", "rename")):
-            style = f"bold {MUTED}"
-        elif line.startswith("@@"):
-            style = "#6fb3c9"
-        elif line.startswith("+"):
-            style = SAGE
-        elif line.startswith("-"):
-            style = BRICK
-        else:
-            style = SAND
-        return Text(line, style=style, no_wrap=True)
+            return f"bold {MUTED}"
+        if line.startswith("@@"):
+            return "#6fb3c9"
+        if line.startswith("+"):
+            return SAGE
+        if line.startswith("-"):
+            return BRICK
+        return SAND
+
+    def plain_text(self) -> str:
+        """Everything on the screen as text, which is also what selecting all would copy."""
+        return "\n".join(
+            str(self.query_one(f"#pr-{part}", Static).render()) for part in ("summary", "checks", "files", "diff")
+        )
 
     def action_close(self) -> None:
         self.dismiss(None)
 
     def action_open_pr(self) -> None:
         if self.pr.url:
-            asyncio.get_running_loop().run_in_executor(None, webbrowser.open, self.pr.url)
+            self.app.open_link(self.pr.url)
 
     def action_reload(self) -> None:
         if prinfo.gh_available():
@@ -486,6 +655,7 @@ class PullRequestScreen(ModalScreen[None]):
 HELP_KEYS = [
     ("n", "Home: start a new cloud session"),
     ("i", "Add a session by link or ID"),
+    ("m", "Session menu (also: right-click, or the ⋮ button)"),
     ("o / y", "Open on claude.ai / copy link"),
     ("d", "Pull request: checks, files and diff"),
     ("t / c", "Teleport / set local checkout"),
@@ -496,6 +666,8 @@ HELP_KEYS = [
     ("esc", "Back to the session list"),
     ("q", "Quit (ctrl+q works anywhere)"),
     ("f1", "This help, even while typing"),
+    ("drag", "Select text; ctrl+c copies it"),
+    ("click", "Open a link (URLs, owner/repo#123)"),
 ]
 
 
@@ -524,6 +696,14 @@ class HelpScreen(ModalScreen[None]):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+class RowList(OptionList):
+    """A list of sessions where only a left click selects a row; a right click is for the session menu."""
+
+    def _on_click(self, event: events.Click) -> None:
+        if event.button != 1:
+            event.prevent_default()  # stops OptionList's own handler, which doesn't look at the button
 
 
 class Chip(Button):
@@ -600,8 +780,17 @@ class CloudSessionsApp(App):
     Chip.remove {{ margin-left: 0; color: {MUTED}; padding: 0 1; background: $surface; }}
     Chip.plain {{ background: $background; color: {MUTED}; }}
 
-    #session-header {{ height: auto; padding: 1 0; border-bottom: hkey $panel; }}
-    #transcript {{ height: 1fr; background: $background; border: none; padding: 1 0 0 0; scrollbar-size-vertical: 1; }}
+    #header-row {{ height: auto; border-bottom: hkey $panel; }}
+    #session-header {{ width: 1fr; height: auto; padding: 1 0; }}
+    #header-row Chip {{ margin: 1 0 0 1; }}
+    #transcript {{ height: 1fr; background: $background; border: none; padding: 1 1 0 0; scrollbar-size-vertical: 1; }}
+    #transcript Static {{ width: 100%; height: auto; }}
+    #transcript .who {{ margin-top: 1; text-style: bold; }}
+    #transcript .tool {{ text-wrap: nowrap; text-overflow: ellipsis; color: {MUTED}; }}
+    #transcript .note {{ color: {MUTED}; text-style: italic; }}
+    #transcript Markdown {{ margin: 0; padding: 0; background: $background; color: {SAND}; }}
+    #transcript Markdown MarkdownBlock {{ color: {SAND}; }}
+    #transcript Markdown MarkdownFence {{ background: $surface; }}
     #activity {{ height: 1; color: {SAGE}; }}
     #pr-bar {{ height: auto; padding: 0 0 1 0; }}
     #composer {{ margin: 0 0 1 0; border: tall $panel; background: $surface; }}
@@ -609,8 +798,15 @@ class CloudSessionsApp(App):
 
     #form, #choice {{ width: 76; height: auto; max-height: 90%; padding: 1 2; background: $surface; border: tall {CLAY}; }}
     #prscreen {{ width: 96%; height: 92%; padding: 1 2; background: $surface; border: tall {CLAY}; }}
-    #pr-log {{ height: 1fr; background: $surface; }}
+    #pr-scroll {{ height: 1fr; background: $surface; }}
+    #pr-scroll Static {{ width: auto; min-width: 100%; height: auto; }}
     #pr-hint {{ height: 1; color: {MUTED}; margin-top: 1; }}
+    #menu {{ width: 46; height: auto; max-height: 90%; padding: 1 2; background: $surface; border: tall {CLAY}; }}
+    #menu-heading {{ text-style: bold; margin-bottom: 1; width: 100%; text-wrap: nowrap; text-overflow: ellipsis; }}
+    #menu-items {{ height: auto; background: $surface; border: none; padding: 0; }}
+    #menu-items > .option-list--option-disabled {{ color: {MUTED}; }}
+    #share-state {{ margin-bottom: 1; }}
+    MenuScreen, ConfirmScreen, ShareScreen {{ align: center middle; }}
     PullRequestScreen {{ align: center middle; }}
     #help {{ width: 64; height: auto; padding: 1 2; background: $surface; border: tall {CLAY}; }}
     #choices {{ height: auto; max-height: 16; background: $surface; border: none; padding: 0; }}
@@ -627,6 +823,7 @@ class CloudSessionsApp(App):
         Binding("n", "new_session", "New"),
         Binding("i", "add_session", "Add by link"),
         Binding("o", "open_web", "Open on web"),
+        Binding("m", "session_menu", "Menu"),
         Binding("d", "pull_request", "PR & diff"),
         Binding("t", "teleport", "Teleport"),
         Binding("y", "copy_link", "Copy link"),
@@ -690,14 +887,14 @@ class CloudSessionsApp(App):
                 yield Button("+ New session", id="new", variant="primary", compact=True)
                 yield Input(placeholder="Search sessions", id="search")
                 yield Static("Ungrouped", id="list-heading")
-                yield OptionList(id="sessions")
+                yield RowList(id="sessions")
             with Vertical(id="main"):
                 yield Static("", id="banner")
                 with ContentSwitcher(id="views", initial="home"):
                     with Vertical(id="home"):
                         yield Static("", id="welcome")
                         yield Static("Sessions", id="home-label")
-                        yield OptionList(id="attention")
+                        yield RowList(id="attention")
                         yield Static("", id="home-spacer")
                         with Vertical(id="newsession"):
                             yield Horizontal(id="chips")
@@ -709,9 +906,11 @@ class CloudSessionsApp(App):
                                 yield Chip("", "effort", classes="plain", tip="Effort")
                             yield Static("enter starts the session · tab moves between settings · esc, then ? lists keys", id="hint")
                     with Vertical(id="convo"):
-                        yield Static("", id="session-header")
+                        with Horizontal(id="header-row"):
+                            yield Static("", id="session-header")
+                            yield Chip("⋮", "menu", classes="plain", tip="Session menu (m, or right-click a session)")
                         yield Static("", id="pr-bar")
-                        yield RichLog(id="transcript", wrap=True, min_width=20)
+                        yield VerticalScroll(id="transcript")
                         yield Static("", id="activity")
                         yield Input(placeholder="Reply to this session", id="composer")
         yield Footer()
@@ -1072,13 +1271,14 @@ class CloudSessionsApp(App):
         sources = session.sources or ([(session.repo, "")] if session.repo else [])
         for index, (repo, revision) in enumerate(sources):
             text.append("" if index == 0 else "   ")
-            text.append(repo or "repository unknown", style=SAND)
+            text.append(repo or "repository unknown", style=link_style(f"https://github.com/{repo}", SAND) if repo else SAND)
             if revision:
-                text.append(f" ⎇ {revision}", style=MUTED)
+                text.append(f" ⎇ {revision}", style=link_style(f"https://github.com/{repo}/tree/{revision}", MUTED))
         if not sources:
             text.append("no repository", style=MUTED)
         env = next((e.name for e in self.envs if e.id == session.environment_id), "")
-        text.append(f"\n{session.id}", style=MUTED)
+        text.append("\n")
+        text.append(session.id, style=link_style(web_url(session.id), MUTED))
         if env:
             text.append(f"  ·  ☁ {env}", style=MUTED)
         checkout = self._checkout(session)
@@ -1111,35 +1311,90 @@ class CloudSessionsApp(App):
         except NoMatches:
             pass  # closing
 
-    def _note(self, text: str) -> None:
-        self.main.query_one("#transcript", RichLog).write(Text(text, style=f"italic {MUTED}"))
+    def _link_context(self) -> LinkContext:
+        """Where a bare #123 in this session's text points: its PR's repository, else its only repository."""
+        session = self.sessions.get(self.selected or "")
+        statuses = relevant(self.branches.get(self.selected or "", []))
+        pr_repos = {s.pr.number: s.pr.repo for s in statuses if s.pr}
+        repos = {repo for repo, _ in (session.sources if session else []) if repo}
+        return LinkContext(default_repo=next(iter(repos)) if len(repos) == 1 else "", pr_repos=pr_repos)
 
-    def _write_message(self, message: Message) -> None:
-        log = self.main.query_one("#transcript", RichLog)
-        if message.kind == "text" and self._after_tool:
-            log.write(Text(""))
-        self._after_tool = message.kind in {"tool_use", "tool_result"}
+    def _note(self, text: str) -> None:
+        self._append([Static(Text(text), classes="note")])
+
+    def _append(self, widgets: list) -> None:
+        """Add to the end of the transcript, and stay at the bottom if that's where the reader was."""
+        if not widgets:
+            return
+        transcript = self.main.query_one("#transcript", VerticalScroll)
+        follow = transcript.scroll_y >= transcript.max_scroll_y - 1
+        transcript.mount(*widgets)
+        if follow:
+            transcript.call_after_refresh(transcript.scroll_end, animate=False)
+
+    def _message_widgets(self, message: Message) -> list:
+        ctx = self._link_context()
         if message.kind == "text":
             if message.role == "assistant":
-                log.write(Text("Claude", style=f"bold {CLAY}"))
-                log.write(Markdown(message.text))
-            elif message.role == "user":
-                log.write(Text("You", style=f"bold {SAND}"))
-                bar = Text()
+                return [
+                    Static(Text("Claude", style=f"bold {CLAY}"), classes="who"),
+                    Markdown(linkify_markdown(message.text, ctx), open_links=False, classes="assistant"),
+                ]
+            if message.role == "user":
+                body = Text()
                 for i, line in enumerate(message.text.splitlines() or [""]):
-                    bar.append("\n" if i else "")
-                    bar.append("▎ ", style=CLAY)
-                    bar.append(line, style=SAND)
-                log.write(bar)
-            else:
-                log.write(Text(f"{message.role}: {message.text}", style=MUTED))
-            log.write(Text(""))
-        elif message.kind == "tool_use":
-            log.write(Text(f"  ⚙ {message.text}", style=MUTED, no_wrap=True, overflow="ellipsis"))
-        elif message.kind == "tool_result":
-            log.write(Text(f"    ↳ {message.text}", style=MUTED, no_wrap=True, overflow="ellipsis"))
-        else:
-            log.write(Text(f"  {message.text}", style=f"italic {MUTED}"))
+                    body.append("\n" if i else "")
+                    body.append("▎ ", style=CLAY)
+                    body.append_text(linkify_text(line, ctx, SAND))
+                return [Static(Text("You", style=f"bold {SAND}"), classes="who"), Static(body, classes="user")]
+            return [Static(linkify_text(f"{message.role}: {message.text}", ctx, MUTED), classes="note")]
+        if message.kind == "tool_use":
+            return [Static(linkify_text(f"  ⚙ {message.text}", ctx, MUTED), classes="tool")]
+        if message.kind == "tool_result":
+            return [Static(linkify_text(f"    ↳ {message.text}", ctx, MUTED), classes="tool")]
+        return [Static(Text(f"  {message.text}"), classes="note")]
+
+    def _write_message(self, message: Message) -> None:
+        self._append(self._message_widgets(message))
+
+    def transcript_text(self) -> str:
+        """The conversation as plain text, as shown (what selecting all of it would copy)."""
+        parts = []
+        for child in self.main.query_one("#transcript", VerticalScroll).children:
+            parts.append(child.source if isinstance(child, Markdown) else str(child.render()))
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------ links and clipboard
+
+    def action_open_link(self, url: str) -> None:
+        """Open a link the reader clicked. A click that ends a text selection is not a click on the link."""
+        if self.screen.get_selected_text():
+            return
+        self.open_link(url)
+
+    def open_link(self, url: str) -> None:
+        if not is_openable(url):
+            self.notify("Only web links are opened from here.", severity="warning")
+            return
+        self.open_url(url)
+
+    def on_markdown_link_clicked(self, event: Markdown.LinkClicked) -> None:
+        event.stop()
+        self.action_open_link(event.href)
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """OSC 52 reaches the clipboard in iTerm2, kitty, WezTerm and others, but not Terminal.app or tmux
+        by default, so also hand the text to the system clipboard tool when there is one."""
+        super().copy_to_clipboard(text)
+        if self.is_headless:
+            return
+        for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+            if shutil.which(tool[0]):
+                try:
+                    subprocess.run(tool, input=text.encode(), timeout=3, check=True)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                return
 
     # ------------------------------------------------------------------ selection
 
@@ -1161,7 +1416,7 @@ class CloudSessionsApp(App):
         self.events_cursor = None
         self.events_error_for = None
         self._after_tool = False
-        self.main.query_one("#transcript", RichLog).clear()
+        self.main.query_one("#transcript", VerticalScroll).remove_children()
         self._render_header()
         self._render_activity()
         self._render_prbar()
@@ -1289,7 +1544,9 @@ class CloudSessionsApp(App):
             return
         event.stop()
         what, i = chip.what, chip.index
-        if what == "env":
+        if what == "menu":
+            self.action_session_menu()
+        elif what == "env":
             options = [(e.id, e.name, "" if e.kind == "anthropic_cloud" else e.kind) for e in self.envs]
             note = "" if options else "No environments loaded yet."
             self.push_screen(ChoiceScreen("Environment", options, self.draft["env"], note=note), self._set_draft("env"))
@@ -1518,8 +1775,10 @@ class CloudSessionsApp(App):
 
     def action_forget(self) -> None:
         session = self._current()
-        if session is None:
-            return
+        if session is not None:
+            self._forget(session)
+
+    def _forget(self, session: Session) -> None:
         if session.id not in self.store.known:
             self.notify("Only sessions saved on this machine can be forgotten here.", severity="warning")
             return
@@ -1530,14 +1789,20 @@ class CloudSessionsApp(App):
     def action_open_web(self) -> None:
         session = self._current()
         if session is not None:
-            asyncio.get_running_loop().run_in_executor(None, webbrowser.open, web_url(session.id))
-            self.notify("Opened on claude.ai.")
+            self._open_web(session)
+
+    def _open_web(self, session: Session) -> None:
+        asyncio.get_running_loop().run_in_executor(None, webbrowser.open, web_url(session.id))
+        self.notify("Opened on claude.ai.")
 
     def action_copy_link(self) -> None:
         session = self._current()
         if session is not None:
-            self.copy_to_clipboard(web_url(session.id))
-            self.notify("Link copied.")
+            self._copy_link(session)
+
+    def _copy_link(self, session: Session) -> None:
+        self.copy_to_clipboard(web_url(session.id))
+        self.notify("Link copied.")
 
     def action_set_checkout(self) -> None:
         session = self._current()
@@ -1560,8 +1825,10 @@ class CloudSessionsApp(App):
 
     def action_teleport(self) -> None:
         session = self._current()
-        if session is None:
-            return
+        if session is not None:
+            self._teleport(session)
+
+    def _teleport(self, session: Session) -> None:
         checkout = self._checkout(session)
         if not checkout:
             self.notify("Set the local checkout first (press c).", severity="warning")
@@ -1584,6 +1851,209 @@ class CloudSessionsApp(App):
         self.show_archived = not self.show_archived
         self._render_list()
         self.notify("Showing archived sessions." if self.show_archived else "Hiding archived sessions.")
+
+    # ------------------------------------------------------------------ session menu
+
+    def _menu_target(self) -> str | None:
+        """The session a menu opened from the keyboard is about: the highlighted sidebar row, else the open one."""
+        sidebar = self.main.query_one("#sessions", OptionList)
+        if sidebar.has_focus and sidebar.highlighted is not None:
+            option = sidebar.get_option_at_index(sidebar.highlighted)
+            if option.id and not option.id.startswith("__"):
+                return option.id
+        return self.selected
+
+    def action_session_menu(self) -> None:
+        sid = self._menu_target()
+        if sid is None or sid not in self.sessions:
+            self.notify("Pick a session first.", severity="warning")
+            return
+        self.open_menu(sid)
+
+    def open_menu(self, sid: str) -> None:
+        session = self.sessions[sid]
+        server = session.from_server
+        items: list[MenuItem | None] = [
+            MenuItem("open", "Open in", submenu=True),
+            None,
+            MenuItem("pin", "Pin", "p", enabled=False, note="unavailable"),
+            MenuItem("read", "Mark as read", "u", enabled=server and session.unread),
+            MenuItem("rename", "Rename", "r", enabled=server),
+            None,
+            MenuItem("share", "Share", enabled=server),
+            MenuItem("copy", "Copy link", "c"),
+            None,
+            MenuItem("group", "Move to group", submenu=True, enabled=False, note="unavailable"),
+            None,
+            MenuItem("archive", "Archive", "a", enabled=server and not session.archived),
+            MenuItem("delete", "Delete" if server else "Forget", "d", danger=True),
+        ]
+        screen = MenuScreen(session.title or session.id, items)
+        self.push_screen(screen, lambda choice: self._menu_choice(sid, choice))
+
+    def _menu_choice(self, sid: str, choice: str | None) -> None:
+        session = self.sessions.get(sid)
+        if choice is None or session is None:
+            return
+        title = session.title or session.id
+        if choice == "open":
+            self._open_in_menu(sid)
+        elif choice == "read":
+            self.mark_read_task(sid)
+        elif choice == "rename":
+            form = FormScreen("Rename session", [("title", "Title", session.title)], "Rename")
+            self.push_screen(form, lambda values: self._rename(sid, values))
+        elif choice == "share":
+            self._share(session)
+        elif choice == "copy":
+            self._copy_link(session)
+        elif choice == "archive":
+            message = f"“{title}” moves to your archived sessions on claude.ai. ccweb can't bring it back, but the web can."
+            self.push_screen(
+                ConfirmScreen("Archive this session?", message, "Archive"),
+                lambda yes: yes and self.archive_task(sid),
+            )
+        elif choice == "delete" and not session.from_server:
+            self._forget(session)
+        elif choice == "delete":
+            message = f"“{title}” is removed from claude.ai along with its conversation. This can't be undone."
+            self.push_screen(
+                ConfirmScreen("Delete this session?", message, "Delete", danger=True),
+                lambda yes: yes and self.delete_task(sid),
+            )
+
+    def _open_in_menu(self, sid: str) -> None:
+        session = self.sessions[sid]
+        items: list[MenuItem | None] = [
+            MenuItem("web", "claude.ai in the browser", "o"),
+            MenuItem("teleport", "Terminal (claude --teleport)", "t"),
+        ]
+        prs = [s.pr for s in relevant(self.branches.get(sid, [])) if s.pr]
+        if prs:
+            items.append(None)
+            items += [MenuItem(f"pr:{pr.url}", f"GitHub {pr.label}", enabled=bool(pr.url)) for pr in prs]
+        screen = MenuScreen("Open in", items)
+
+        def chosen(choice: str | None) -> None:
+            if choice == "web":
+                self._open_web(session)
+            elif choice == "teleport":
+                self._teleport(session)
+            elif choice and choice.startswith("pr:"):
+                self.open_link(choice[3:])
+
+        self.push_screen(screen, chosen)
+
+    def _rename(self, sid: str, values: dict | None) -> None:
+        title = (values or {}).get("title", "").strip()
+        session = self.sessions.get(sid)
+        if not title or session is None or title == session.title:
+            return
+        self.rename_task(sid, title)
+
+    def _share(self, session: Session) -> None:
+        screen = ShareScreen(session)
+
+        def done(choice: str | None) -> None:
+            if choice == "copy":
+                self._copy_link(session)
+            elif choice == "open":
+                self._open_web(session)
+
+        self.push_screen(screen, done)
+        self.load_share_status(session.id, screen)
+
+    @background(group="share")
+    async def load_share_status(self, sid: str, screen: ShareScreen) -> None:
+        try:
+            status, error = await self.api.share_status(sid), ""
+        except (ApiError, AuthError) as exc:
+            status, error = None, str(exc)
+        if screen.is_attached:
+            screen.show(status, error)
+
+    def _after_change(self) -> None:
+        self._render_list()
+        self._render_attention()
+        self._render_header()
+
+    @background(group="action")
+    async def mark_read_task(self, sid: str) -> None:
+        try:
+            await self.api.mark_read(sid)
+        except (ApiError, AuthError) as exc:
+            self.notify(f"Couldn't mark it as read: {exc}", severity="error", timeout=10)
+            return
+        if sid in self.sessions:
+            self.sessions[sid].unread = False
+        self.notify("Marked as read.")
+        self._after_change()
+        self.refresh_sessions()
+
+    @background(group="action")
+    async def rename_task(self, sid: str, title: str) -> None:
+        try:
+            await self.api.rename_session(sid, title)
+        except (ApiError, AuthError) as exc:
+            self.notify(f"Couldn't rename it: {exc}", severity="error", timeout=10)
+            return
+        if sid in self.sessions:
+            self.sessions[sid].title = title
+        self.notify("Renamed.")
+        self._after_change()
+        self.refresh_sessions()
+
+    @background(group="action")
+    async def archive_task(self, sid: str) -> None:
+        try:
+            await self.api.archive_session(sid)
+        except (ApiError, AuthError) as exc:
+            self.notify(f"Couldn't archive it: {exc}", severity="error", timeout=10)
+            return
+        if sid in self.sessions:
+            self.sessions[sid].archived = True
+        if self.selected == sid and not self.show_archived:
+            self._select(None)
+        self.notify("Archived. Press v to show archived sessions.")
+        self._after_change()
+        self.refresh_sessions()
+
+    @background(group="action")
+    async def delete_task(self, sid: str) -> None:
+        try:
+            await self.api.delete_session(sid)
+        except (ApiError, AuthError) as exc:
+            self.notify(f"Couldn't delete it: {exc}", severity="error", timeout=10)
+            return
+        for table in (self.sessions, self.older, self.branches):
+            table.pop(sid, None)
+        self.store.remove_known(sid)
+        if self.selected == sid:
+            self._select(None)
+        self.notify("Deleted.")
+        self._after_change()
+        self.refresh_sessions()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        """Right-click a session, in the sidebar, on the home list or anywhere in its conversation, for its menu."""
+        if event.button != 3 or len(self.screen_stack) > 1:
+            return
+        try:
+            widget, region = self.screen.get_widget_at(event.screen_x, event.screen_y)
+        except Exception:  # nothing under the pointer
+            return
+        sid: str | None = None
+        if isinstance(widget, OptionList) and widget.id in {"sessions", "attention"}:
+            line = event.screen_y - region.y + widget.scroll_offset.y
+            if 0 <= line < widget.option_count:
+                option = widget.get_option_at_index(line)
+                if option.id and not option.id.startswith("__"):
+                    sid = option.id
+        elif self.selected and any(a.id == "convo" for a in widget.ancestors_with_self):
+            sid = self.selected
+        if sid in self.sessions:
+            event.stop()
+            self.open_menu(sid)
 
     def action_pull_request(self) -> None:
         session = self._current()

@@ -86,6 +86,30 @@ That endpoint leaves CI results empty, so check counts come from the `gh` CLI. P
 
 Both are looked up as the sessions refresh (every 30 seconds for the sidebar, every 15 for the open session), and only for your newest 40 sessions. A session that opened PRs in several repositories shows each one.
 
+## Session menu
+
+Press `m` on a session, right-click it (in the sidebar, on the home list, or anywhere in its conversation), or use the `⋮` button next to the title. The menu mirrors the web's, with the same shortcut letters while it's open:
+
+| Item | Key | What it does |
+| --- | --- | --- |
+| Open in › | | claude.ai in the browser, a terminal (`claude --teleport`), or the session's PRs on GitHub |
+| Pin | `P` | Not available (see below) |
+| Mark as read | `U` | Clears the unread dot on claude.ai too. Opening a session in ccweb doesn't mark it read |
+| Rename | `R` | Changes the title everywhere |
+| Share | | Shows who can see the session. Changing that is done on claude.ai |
+| Copy link | `C` | Copies `claude.ai/code/<id>` |
+| Move to group › | | Not available (see below) |
+| Archive | `A` | Asks first. ccweb can archive but not restore; the web can restore |
+| Delete | `D` | Asks first, and can't be undone. For a session you only added by link, it forgets it locally instead |
+
+Rename, mark read and archive are the calls the `claude` CLI itself makes. Delete uses the verb the server lists for sessions. **Pin and groups aren't offered** because that state isn't on the session objects or on any route ccweb can reach; they appear to live in account-level settings behind claude.ai's browser check. To add them, someone needs the request the web sends when you pin or move a session.
+
+## Links, selecting and copying
+
+Text that looks like a link is clickable: web URLs, `owner/repo#123`, and a bare `#123` when the session makes clear which repository it means (its PR's, or its only repository). Repository names, branches, the session ID and the PR bar are links too. A click opens it. That works in any terminal. Terminals that handle hyperlinks themselves, such as iTerm2 and WezTerm, also open them on Cmd-click, because the links are real terminal hyperlinks as well. Only `http`, `https` and `mailto` links are ever opened.
+
+Drag to select text anywhere in a conversation, the PR header or the diff, then press `Ctrl+C` to copy. A click that ends a drag doesn't open a link. Copying uses the terminal's clipboard support and also `pbcopy`, `wl-copy` or `xclip` when present, so it works in Terminal.app too.
+
 ## Keys
 
 While the prompt box has focus (the home page opens that way), letters are typed into it. Press `Esc` first to use the shortcuts below, or `F1` for help from anywhere.
@@ -96,6 +120,7 @@ While the prompt box has focus (the home page opens that way), letters are typed
 | `Enter` | Open the session and jump to the reply box |
 | `Esc` | Back to the session list |
 | `n` | Home page: start a new session |
+| `m` | Session menu (rename, archive, delete, and the rest) |
 | `i` | Add a session by its claude.ai/code link |
 | `o` | Open on claude.ai |
 | `y` | Copy link |

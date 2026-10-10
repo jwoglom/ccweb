@@ -50,7 +50,7 @@ def test_normalize_events():
     msgs = normalize_events(EVENTS)
     kinds = [(m.role, m.kind) for m in msgs]
     assert kinds == [("user", "text"), ("assistant", "text"), ("assistant", "tool_use"),
-                     ("user", "tool_result"), ("assistant", "text")]
+                     ("user", "tool_result"), ("assistant", "text"), ("assistant", "text")]
     assert msgs[2].text == "Bash  pytest -x tests/test_import.py"
     assert msgs[3].text == "1 failed, 12 passed"
     reversed_payload = {"data": list(reversed(EVENTS["data"]))}
@@ -159,7 +159,7 @@ def test_api_paging_and_environments(tmp_path, monkeypatch):
             second = await api.list_sessions_page(after_id=first.last_id)
             assert [s.id for s in second.sessions] == ["session_01OlderFFFFFFFFF"] and not second.has_more
             events = await api.list_events_page("session_01NeedsInputAAAA")
-            assert len(events.messages) == 5
+            assert len(events.messages) == 6
             assert (await api.list_events_page("session_01NeedsInputAAAA", after_id="x")).messages == []
             assert [e.name for e in await api.list_environments()] == ["Default", "Unrestricted", "My laptop"]
             detail = await api.get_session("session_01NeedsInputAAAA")
@@ -265,4 +265,69 @@ def test_branch_statuses_map_rows_to_sessions(tmp_path, monkeypatch):
     asyncio.run(run())
     body = [r for r in server.requests if r.get("body")][0]["body"]
     assert body["include_review_decision"] is True and len(body["repo_branches"]) == 2
+    server.close()
+
+
+def test_links_in_text_and_markdown():
+    from ccweb.links import LinkContext, is_openable, linkify_markdown, linkify_text
+
+    ctx = LinkContext(default_repo="o/r", pr_repos={525: "owner/other"})
+    text = linkify_text("see https://example.com/a, owner/repo#12 and #525 (and #7).", ctx)
+    found = {text.plain[span.start:span.end]: span.style for span in text.spans if getattr(span.style, "link", None)}
+    assert set(found) == {"https://example.com/a", "owner/repo#12", "#525", "#7"}  # trailing comma and ")" stay out
+    assert found["https://example.com/a"].link == "https://example.com/a"
+    assert found["owner/repo#12"].link == "https://github.com/owner/repo/issues/12"
+    assert found["#525"].link == "https://github.com/owner/other/issues/525"  # the session's own PR wins
+    assert found["#7"].link == "https://github.com/o/r/issues/7"  # the session's only repository
+    assert found["#7"].meta["@click"] == "app.open_link('https://github.com/o/r/issues/7')"
+    # without a repository for it, a bare #7 is not guessed at, and file paths aren't mistaken for references
+    bare = linkify_text("#7 and src/main.py#L10 and x/y/z#3", LinkContext())
+    assert [bare.plain[s.start:s.end] for s in bare.spans if getattr(s.style, "link", None)] == []
+
+    source = "Fixes owner/repo#5, not `owner/repo#6`, [x](https://e.com/owner/repo#7) or #525.\n```\nowner/repo#8 #525\n```"
+    out = linkify_markdown(source, ctx)
+    assert "[owner/repo#5](https://github.com/owner/repo/issues/5)" in out
+    assert "[#525](https://github.com/owner/other/issues/525)." in out
+    assert "`owner/repo#6`" in out and "owner/repo#8 #525\n```" in out  # code is left alone
+    assert out.count("owner/repo#7") == 1 and "[x](https://e.com/owner/repo#7)" in out  # existing links aren't nested
+
+    assert is_openable("https://x.test/a") and is_openable("mailto:a@b.test")
+    assert not is_openable("file:///etc/passwd") and not is_openable("javascript:alert(1)") and not is_openable("../x.md")
+
+
+def test_session_actions_hit_the_right_endpoints(tmp_path, monkeypatch):
+    import pytest
+
+    from ccweb.api import ApiError
+    from fakes import FakeServer
+
+    server = FakeServer()
+    monkeypatch.setenv("CCWEB_BASE_URL", server.url)
+    monkeypatch.setenv("CCWEB_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("CCWEB_ORG_UUID", "11111111-2222-3333-4444-555555555555")
+    sid = "session_01NeedsInputAAAA"
+
+    async def run():
+        api = CloudApi(load_config(str(tmp_path / "missing.toml")))
+        try:
+            await api.rename_session(sid, "A better title")
+            await api.mark_read(sid)
+            await api.archive_session(sid)
+            await api.delete_session(sid)  # answers 204 with no body
+            assert (await api.share_status(sid))["effective_visibility"] == "private"
+            for call in (api.rename_session, api.archive_session, api.mark_read, api.delete_session):
+                args = ("t",) if call == api.rename_session else ()
+                with pytest.raises(ApiError) as failure:
+                    await call("session_01FailXXXXXXXXXX", *args)
+                assert "HTTP 403" in str(failure.value) and "not allowed (forbidden)" in str(failure.value)
+        finally:
+            await api.aclose()
+
+    asyncio.run(run())
+    assert server.actions == [
+        ("PUT", f"/v1/code/sessions/{sid}", {"title": "A better title"}),
+        ("POST", f"/v1/code/sessions/{sid}/mark_read", {}),
+        ("POST", f"/v1/code/sessions/{sid}/archive", {}),
+        ("DELETE", f"/v1/sessions/{sid}", {}),
+    ]
     server.close()

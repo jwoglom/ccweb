@@ -135,6 +135,8 @@ EVENTS = {
              {"type": "tool_result", "content": "1 failed, 12 passed\nmore"}]}},
         {"uuid": "e4", "type": "assistant", "created_at": "2026-10-10T10:00:15Z",
          "message": {"role": "assistant", "content": [{"type": "text", "text": "Should I widen the timeout or mock the clock?"}]}},
+        {"uuid": "e5", "type": "assistant", "created_at": "2026-10-10T10:00:20Z",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "See https://example.com/doc and example-org/example-repo#77 for details."}]}},
     ]
 }
 
@@ -143,6 +145,30 @@ class FakeServer:
     def __init__(self):
         self.requests: list[dict] = []
         self.created: list[dict] = []
+        self.actions: list[tuple] = []  # (method, path, body) of rename / mark read / archive / delete
+        self.read: set[str] = set()
+        self.titles: dict[str, str] = {}
+        self.archived: set[str] = set()
+        self.deleted: set[str] = set()
+
+        def norm(sid):  # the legacy cse_ form and session_ name the same session
+            return "session_" + sid[4:] if sid.startswith("cse_") else sid
+
+        def sessions_now(page):
+            rows = []
+            for row in page["data"]:
+                key = norm(row["id"])
+                if key in outer.deleted:
+                    continue
+                row = dict(row)
+                if key in outer.read:
+                    row["unread"] = False
+                if key in outer.titles:
+                    row["title"] = outer.titles[key]
+                if key in outer.archived:
+                    row["session_status"] = "archived"
+                rows.append(row)
+            return {**page, "data": rows}
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -156,16 +182,48 @@ class FakeServer:
                 url = urlparse(self.path)
                 query = parse_qs(url.query)
                 if url.path == "/v1/sessions":
-                    return self._send(200, SESSIONS_PAGE_2 if "after_id" in query else SESSIONS)
+                    return self._send(200, sessions_now(SESSIONS_PAGE_2 if "after_id" in query else SESSIONS))
+                if url.path.endswith("/share"):
+                    return self._send(200, {"current_last_sequence_num": "3", "effective_visibility": "private",
+                                            "prospective_visibility_type": "org_only", "sharing_settings": None})
                 if url.path == "/v1/environment_providers":
                     return self._send(200, ENVIRONMENTS)
                 if url.path.startswith("/v1/sessions/") and url.path.endswith("/events"):
                     return self._send(200, {"data": [], "has_more": False} if "after_id" in query else EVENTS)
                 if url.path.startswith("/v1/sessions/"):
                     sid = url.path.rsplit("/", 1)[-1]
-                    match = next((s for s in SESSIONS["data"] if s["id"] == sid), None)
+                    match = next((s for s in sessions_now(SESSIONS)["data"] if norm(s["id"]) == sid), None)
                     return self._send(200, match) if match else self._send(404, {"error": {"message": "no session"}})
                 return self._send(404, {"error": {"message": "not found"}})
+
+            def _mutation(self):
+                length = int(self.headers.get("content-length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+                outer.requests.append(
+                    {"method": self.command, "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body}
+                )
+                if self.headers.get("authorization") != "Bearer test-token":
+                    return self._send(401, {"error": {"message": "bad token"}})
+                if "Fail" in self.path:
+                    return self._send(403, {"error": {"message": "not allowed", "reason": "forbidden"}})
+                outer.actions.append((self.command, self.path, body))
+                sid = next((p for p in self.path.split("/") if p.startswith(("session_", "cse_"))), "")
+                if self.command == "PUT":
+                    outer.titles[sid] = body.get("title", "")
+                if self.command == "DELETE":
+                    outer.deleted.add(sid)
+                if self.command == "DELETE":
+                    self.send_response(204)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
+                return self._send(200, {})
+
+            def do_PUT(self):
+                return self._mutation()
+
+            def do_DELETE(self):
+                return self._mutation()
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
@@ -174,6 +232,13 @@ class FakeServer:
                 )
                 if self.headers.get("authorization") != "Bearer test-token":
                     return self._send(401, {"error": {"message": "bad token"}})
+                if self.path.endswith(("/archive", "/mark_read")):
+                    if "Fail" in self.path:
+                        return self._send(403, {"error": {"message": "not allowed", "reason": "forbidden"}})
+                    outer.actions.append(("POST", self.path, body))
+                    sid = next(p for p in self.path.split("/") if p.startswith(("session_", "cse_")))
+                    (outer.read if self.path.endswith("/mark_read") else outer.archived).add(sid)
+                    return self._send(200, {})
                 if self.path == "/v1/code/github/get-batch-branch-status":
                     pairs = body.get("repo_branches", [])
                     if len(pairs) > 50:
