@@ -1,0 +1,23 @@
+# Copy to ~/.config/ccweb/config.toml and change only what you need.
+
+[api]
+base_url = "https://api.anthropic.com"
+anthropic_version = "2023-06-01"
+anthropic_beta = "ccr-byoc-2025-07-29"
+send_org_header = true
+# Undocumented. Replace with what `ccweb probe` or tools/mitm_capture.py shows.
+list_sessions = "GET /v1/sessions"
+list_events = "GET /v1/sessions/{id}/events"
+timeout_seconds = 20
+
+[poll]
+sessions_seconds = 30   # how often the session list refreshes
+events_seconds = 5      # how often the open conversation refreshes
+
+[claude]
+bin = "claude"
+# Team/Enterprise self-hosted environment (ccpool_...). Leave empty for Anthropic-hosted.
+environment_id = ""
+
+[auth]
+keychain_service = "Claude Code-credentials"   # macOS only
