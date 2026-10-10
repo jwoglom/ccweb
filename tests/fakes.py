@@ -51,10 +51,57 @@ SESSIONS = {
             "status_bucket": "review_ready",
             "updated_at": "2026-10-10T12:00:00Z",
             "unread": False,
+            "session_context": {
+                "outcomes": [{"type": "git_repository",
+                              "git_info": {"type": "github", "repo": "example-org/uploader", "branches": ["claude/other-work"]}}],
+            },
         },
     ],
     "has_more": True,
     "last_id": "session_01ArchivedCCCCC",
+}
+
+BRANCH_STATUS_BY_SESSION = {
+    "session_01NeedsInputAAAA": {
+        "repo": "example-org/example-repo",
+        "branch": "claude/fix-flaky-test",
+        "branch_exists": True,
+        "commits": 2,
+        "has_changes": True,
+        "default_branch": "dev",
+        "pull_request": {
+            "number": 77,
+            "state": "draft",
+            "title": "Fix flaky CGM import test",
+            "url": "https://github.com/example-org/example-repo/pull/77",
+            "additions": 40,
+            "deletions": 3,
+            "commits": 2,
+            "base_ref": "dev",
+            "head_sha": "a" * 40,
+            "checks": [],
+            "deployments": [],
+            "review_decision": "REVIEW_REQUIRED",
+            "auto_merge_enabled": False,
+        },
+    },
+    "session_01RunningBBBBBBB": {
+        "repo": "example-org/docs",
+        "branch": "claude/update-docs",
+        "branch_exists": True,
+        "commits": 1,
+        "pull_request": {
+            "number": 12,
+            "state": "merged",
+            "title": "Update API docs",
+            "url": "https://github.com/example-org/docs/pull/12",
+            "additions": 9,
+            "deletions": 9,
+            "commits": 1,
+            "base_ref": "main",
+            "checks": [],
+        },
+    },
 }
 
 SESSIONS_PAGE_2 = {
@@ -127,6 +174,19 @@ class FakeServer:
                 )
                 if self.headers.get("authorization") != "Bearer test-token":
                     return self._send(401, {"error": {"message": "bad token"}})
+                if self.path == "/v1/code/github/get-batch-branch-status":
+                    pairs = body.get("repo_branches", [])
+                    if len(pairs) > 50:
+                        return self._send(400, {"error": {"message": f"too many repo_branches: {len(pairs)} (max 50)"}})
+                    rows = []
+                    for sid in body.get("session_ids", []):
+                        if sid in BRANCH_STATUS_BY_SESSION:
+                            rows.append({**BRANCH_STATUS_BY_SESSION[sid], "session_id": sid})
+                    for pair in pairs:  # a branch with commits but no PR yet, reported without a session
+                        if pair["branch"] == "claude/other-work":
+                            rows.append({"repo": pair["repo"], "branch": pair["branch"], "branch_exists": True,
+                                         "commits": 2, "has_changes": True, "default_branch": "dev"})
+                    return self._send(200, {"branch_statuses": rows})
                 if self.path == "/v1/sessions":
                     if not body.get("environment_id"):
                         return self._send(400, {"error": {"message": "environment required", "reason": "no_env"}})

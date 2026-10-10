@@ -23,6 +23,7 @@ DEFAULTS: dict[str, Any] = {
         "get_session": "GET /v1/sessions/{id}",
         "list_environments": "GET /v1/environment_providers",
         "create_session": "POST /v1/sessions",
+        "branch_status": "POST /v1/code/github/get-batch-branch-status",
         "timeout_seconds": 20,
     },
     "poll": {"sessions_seconds": 30, "events_seconds": 5},

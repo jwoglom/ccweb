@@ -21,6 +21,7 @@ import httpx
 from . import __version__
 from .auth import AuthError, nudge_cli_refresh, read_access_token, read_org_uuid
 from .config import parse_endpoint
+from .prinfo import BranchStatus, parse_branch_status
 
 USER_AGENT = f"ccweb/{__version__} (personal client)"
 
@@ -163,6 +164,7 @@ class Session:
     environment_id: str = ""
     environment_kind: str = ""
     sources: list[tuple[str, str]] = field(default_factory=list)  # (owner/repo, base revision)
+    outcomes: list[tuple[str, str]] = field(default_factory=list)  # (owner/repo, branch Claude pushes to)
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -187,6 +189,11 @@ def normalize_session(obj: dict) -> Session | None:
     for source in context.get("sources") or []:
         if isinstance(source, dict) and isinstance(source.get("url"), str):
             sources.append((parse_repo(source["url"]), str(source.get("revision") or "")))
+    outcomes = []
+    for outcome in context.get("outcomes") or []:
+        info = outcome.get("git_info") if isinstance(outcome, dict) else None
+        if isinstance(info, dict) and isinstance(info.get("repo"), str):
+            outcomes += [(info["repo"], b) for b in info.get("branches") or [] if isinstance(b, str) and b]
     archived = bool(obj.get("archived") or obj.get("archived_at")) or status.lower() == "archived"
     return Session(
         id=norm_id(raw_id),
@@ -208,6 +215,7 @@ def normalize_session(obj: dict) -> Session | None:
         environment_id=str(obj.get("environment_id") or ""),
         environment_kind=str(obj.get("environment_kind") or ""),
         sources=sources,
+        outcomes=outcomes,
         raw=obj,
     )
 
@@ -489,6 +497,30 @@ class CloudApi:
                 break
         return out
 
+    async def branch_statuses(self, sessions: list[Session], review: bool = False) -> dict[str, list[BranchStatus]]:
+        """PRs and branch state for sessions, as the web sidebar asks for them: by session, and by (repo, branch).
+
+        The endpoint takes at most 50 repo/branch pairs per call, so sessions are sent in groups.
+        """
+        result: dict[str, list[BranchStatus]] = {s.id: [] for s in sessions}
+        for group in _groups(sessions):
+            pairs = list(dict.fromkeys((repo, branch) for s in group for repo, branch in s.outcomes))
+            body = {
+                "repo_branches": [{"repo": repo, "branch": branch} for repo, branch in pairs],
+                "discover_session_prs": True,
+                "session_ids": [s.id for s in group],
+                "include_review_decision": review,
+            }
+            payload = await self.request("branch_status", body=body)
+            rows = payload.get("branch_statuses") if isinstance(payload, dict) else None
+            for session_id, status in filter(None, map(parse_branch_status, rows or [])):
+                owners = [session_id] if session_id in result else [
+                    s.id for s in group if (status.repo.lower(), status.branch) in {(r.lower(), b) for r, b in s.outcomes}
+                ]
+                for owner in owners:
+                    result[owner].append(status)
+        return result
+
     async def create_session(self, body: dict) -> str:
         """Create a cloud session; returns its ID. The request body mirrors what `claude --cloud` sends."""
         payload = await self.request("create_session", body=body)
@@ -498,6 +530,20 @@ class CloudApi:
         if not isinstance(found, str) or not found:
             raise ApiError(None, "POST", "create_session", "the response didn't include a session ID")
         return norm_id(found)
+
+
+def _groups(sessions: list[Session], max_sessions: int = 25, max_pairs: int = 50):
+    group: list[Session] = []
+    pairs: set = set()
+    for session in sessions:
+        wanted = pairs | set(session.outcomes)
+        if group and (len(group) >= max_sessions or len(wanted) > max_pairs):
+            yield group
+            group, wanted = [], set(session.outcomes)
+        group.append(session)
+        pairs = wanted
+    if group:
+        yield group
 
 
 def _error_detail(body: Any) -> str:

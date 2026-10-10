@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -19,12 +20,13 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, ContentSwitcher, Footer, Input, Label, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
-from . import claude_cli, gitinfo
+from . import claude_cli, gitinfo, prinfo
 from .api import (
     ApiError,
     AuthError,
@@ -37,6 +39,7 @@ from .api import (
     parse_session_ref,
     web_url,
 )
+from .prinfo import BranchStatus, Details, PullRequest, best_pr_state, check_counts, relevant
 from .store import Store
 
 CLAY = "#d4835f"
@@ -46,6 +49,11 @@ AMBER = "#e0b354"
 SAGE = "#8db580"
 BRICK = "#e06c5f"
 BLUE = "#6f9be8"
+PURPLE = "#a78bfa"
+PR_COLOURS = {"open": SAGE, "draft": MUTED, "merged": PURPLE, "closed": BRICK}
+PR_ICON_COLOURS = {"open": "#b9b3a8", "draft": "#b9b3a8", "merged": PURPLE, "closed": BRICK}  # the web's sidebar tints
+CHECK_GLYPHS = {"success": ("✓", SAGE), "failure": ("✗", BRICK), "pending": ("◔", AMBER), "skipped": ("–", MUTED)}
+REVIEW_LABELS = {"APPROVED": ("approved", SAGE), "CHANGES_REQUESTED": ("changes requested", BRICK), "REVIEW_REQUIRED": ("review required", AMBER)}
 
 THEME = Theme(
     name="ccweb",
@@ -105,8 +113,8 @@ def is_working(session: Session, optimistic: dict[str, float] | None = None) -> 
     return session.status.lower() in WORKING or session.bucket.lower() == "working"
 
 
-def status_kind(session: Session, optimistic: dict[str, float] | None = None) -> str:
-    """archived | working | needs_input | failed | review | idle"""
+def status_kind(session: Session, optimistic: dict[str, float] | None = None, pr_state: str = "") -> str:
+    """archived | working | needs_input | failed | review | idle. A live PR counts as ready for review, as on the web."""
     if session.archived:
         return "archived"
     if is_working(session, optimistic):
@@ -116,14 +124,16 @@ def status_kind(session: Session, optimistic: dict[str, float] | None = None) ->
         return "needs_input"
     if signals & FAILED:
         return "failed"
-    if signals & REVIEW:
+    if signals & REVIEW or pr_state in {"open", "draft"}:
         return "review"
     return "idle"
 
 
-def describe_status(session: Session, optimistic: dict[str, float] | None = None, frame: int = 0) -> tuple[str, str, str]:
+def describe_status(
+    session: Session, optimistic: dict[str, float] | None = None, frame: int = 0, pr_state: str = ""
+) -> tuple[str, str, str]:
     """(glyph, colour, label). Like the web: a filled dot means unread, a hollow one means seen."""
-    kind = status_kind(session, optimistic)
+    kind = status_kind(session, optimistic, pr_state)
     dot = "●" if session.unread else "○"
     if kind == "archived":
         return "◌", MUTED, "Archived"
@@ -139,6 +149,8 @@ def describe_status(session: Session, optimistic: dict[str, float] | None = None
         return "○", MUTED, "Saved here, not loaded from claude.ai"
     if session.unread:
         return "●", BLUE, "Unread"
+    if pr_state == "merged":
+        return "○", PURPLE, "PR merged"
     label = "Completed" if session.bucket.lower() == "completed" else session.status.replace("_", " ").capitalize()
     return "○", MUTED, label or "Idle"
 
@@ -168,13 +180,17 @@ def by_recency(sessions) -> list[Session]:
 
 
 def home_sessions(
-    sessions: list[Session], optimistic: dict[str, float] | None = None, limit: int = HOME_ROWS
+    sessions: list[Session],
+    optimistic: dict[str, float] | None = None,
+    limit: int = HOME_ROWS,
+    pr_states: dict[str, str] | None = None,
 ) -> list[Session]:
     """What the home page leads with: recent unread questions for you, then work ready for review, then the rest."""
     live = by_recency(s for s in sessions if not s.archived)
     recent = [s for s in live if s.last_activity and datetime.now(timezone.utc) - s.last_activity < ATTENTION_WINDOW]
-    waiting = [s for s in recent if status_kind(s, optimistic) == "needs_input" and s.unread]
-    review = [s for s in recent if status_kind(s, optimistic) == "review"]
+    pr_of = (pr_states or {}).get
+    waiting = [s for s in recent if status_kind(s, optimistic, pr_of(s.id, "")) == "needs_input" and s.unread]
+    review = [s for s in recent if status_kind(s, optimistic, pr_of(s.id, "")) == "review"]
     rest = [s for s in live if s not in waiting and s not in review]
     return (waiting + review + rest)[:limit]
 
@@ -195,6 +211,43 @@ def welcome_name() -> str:
         if isinstance(name, str) and name.strip():
             return name.strip().split()[0]
     return ""
+
+
+def pr_line(status: BranchStatus, details: Details | None = None) -> Text:
+    """One line about a PR, or about a pushed branch that has none yet."""
+    line = Text(no_wrap=True, overflow="ellipsis")
+    pr = status.pr
+    if pr is None:
+        line.append("⎇ ", style=MUTED)
+        line.append(f"{status.repo} {status.branch}", style=SAND)
+        noun = "commit" if status.commits == 1 else "commits"
+        line.append(f"  {status.commits} {noun} pushed, no PR yet", style=MUTED)
+        return line
+    colour = PR_COLOURS.get(pr.state, MUTED)
+    line.append("⎇ ", style=colour)
+    line.append(pr.label, style=f"bold {SAND}")
+    line.append(f"  {pr.state.capitalize()}", style=colour)
+    if pr.additions or pr.deletions:
+        line.append("  ")
+        line.append(f"+{pr.additions}", style=SAGE)
+        line.append(f" −{pr.deletions}", style=BRICK)
+    checks = (details.checks if details and details.checks else pr.checks) if pr.is_live else []
+    if checks:
+        passing, failing, pending = check_counts(checks)
+        line.append("  CI", style=MUTED)
+        for glyph_key, count in (("success", passing), ("failure", failing), ("pending", pending)):
+            if count:
+                glyph, glyph_colour = CHECK_GLYPHS[glyph_key]
+                line.append(f" {glyph}{count}", style=glyph_colour)
+    review = (details.review if details and details.review else pr.review) if pr.is_live else ""
+    if review in REVIEW_LABELS:
+        label, review_colour = REVIEW_LABELS[review]
+        line.append(f"  {label}", style=review_colour)
+    if pr.auto_merge:
+        line.append("  auto-merge", style=MUTED)
+    if pr.title:
+        line.append(f"  {pr.title}", style=MUTED)
+    return line
 
 
 # ---------------------------------------------------------------------- screens
@@ -308,10 +361,133 @@ class ChoiceScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class PullRequestScreen(ModalScreen[None]):
+    """A PR's summary, CI checks, changed files and diff. The last three come from the gh CLI."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("q", "close", "Close", show=False),
+        Binding("o", "open_pr", "Open on GitHub"),
+        Binding("r", "reload", "Reload"),
+    ]
+
+    def __init__(self, pr: PullRequest, details: Details | None = None):
+        super().__init__()
+        self.pr = pr
+        self.details = details
+        self.diff: str | None = None
+        self.diff_error = ""
+        self.busy = prinfo.gh_available()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prscreen"):
+            yield RichLog(id="pr-log", wrap=False, markup=False, highlight=False, auto_scroll=False)
+            yield Static("o opens the PR · r reloads · esc closes", id="pr-hint")
+
+    def on_mount(self) -> None:
+        self._paint()
+        self.query_one("#pr-log", RichLog).focus()
+        if self.busy:
+            self._load()
+
+    @work(exclusive=True, group="pr-load")
+    async def _load(self) -> None:
+        self.busy = True
+        self._paint()
+        self.details = await asyncio.to_thread(prinfo.gh_details, self.pr.url)
+        self._paint()
+        self.diff, self.diff_error = await asyncio.to_thread(prinfo.gh_diff, self.pr.url)
+        self.busy = False
+        self._paint()
+
+    def _paint(self) -> None:
+        log = self.query_one("#pr-log", RichLog)
+        log.clear()
+        pr, details = self.pr, self.details
+        colour = PR_COLOURS.get(pr.state, MUTED)
+        log.write(Text.assemble(("⎇ ", colour), (pr.label, f"bold {SAND}"), (f"  {pr.state.capitalize()}", colour)))
+        if pr.title:
+            log.write(Text(pr.title, style=f"bold {SAND}"))
+        facts = [f"+{pr.additions} −{pr.deletions}", f"{pr.commits} commit{'s' if pr.commits != 1 else ''}"]
+        if pr.base:
+            facts.append(f"into {pr.base}")
+        review = (details.review if details and details.review else pr.review)
+        if review in REVIEW_LABELS:
+            facts.append(REVIEW_LABELS[review][0])
+        if details and details.mergeable and details.mergeable != "UNKNOWN":
+            facts.append(details.mergeable.lower())
+        log.write(Text("  ·  ".join(facts), style=MUTED))
+        log.write(Text(pr.url, style=MUTED))
+        log.write(Text(""))
+
+        checks = details.checks if details and details.checks else pr.checks
+        log.write(Text("Checks", style=f"bold {CLAY}"))
+        if checks:
+            order = {"failure": 0, "pending": 1, "success": 2, "skipped": 3}
+            for check in sorted(checks, key=lambda c: (order.get(c.state, 4), c.name)):
+                glyph, glyph_colour = CHECK_GLYPHS[check.state]
+                log.write(Text.assemble((f"  {glyph} ", glyph_colour), (check.name, SAND), (f"  {check.state}", MUTED)))
+        elif not prinfo.gh_available():
+            log.write(Text("  CI results need the gh CLI: install it and run `gh auth login`.", style=MUTED))
+        elif details and details.error:
+            log.write(Text(f"  Couldn't read checks: {details.error}", style=MUTED))
+        elif self.busy and details is None:
+            log.write(Text("  Loading…", style=MUTED))
+        else:
+            log.write(Text("  No checks reported.", style=MUTED))
+        log.write(Text(""))
+
+        if details and details.files:
+            log.write(Text(f"Files changed ({len(details.files)})", style=f"bold {CLAY}"))
+            for path, added, removed in details.files:
+                log.write(Text.assemble((f"  +{added:<5}", SAGE), (f"−{removed:<5}", BRICK), (path, SAND)))
+            log.write(Text(""))
+
+        log.write(Text("Diff", style=f"bold {CLAY}"))
+        if self.diff:
+            for line in self.diff.splitlines():
+                log.write(self._style_diff_line(line))
+        elif self.diff_error:
+            log.write(Text(f"  Couldn't read the diff: {self.diff_error}", style=MUTED))
+        elif not prinfo.gh_available():
+            log.write(Text("  The diff needs the gh CLI: install it and run `gh auth login`.", style=MUTED))
+        elif self.busy:
+            log.write(Text("  Loading…", style=MUTED))
+        else:
+            log.write(Text("  No changes.", style=MUTED))
+        log.call_after_refresh(log.scroll_home, animate=False)  # after layout, so it lands on the summary
+
+    @staticmethod
+    def _style_diff_line(line: str) -> Text:
+        if line.startswith(("diff --git", "index ", "+++", "---", "new file", "deleted file", "similarity", "rename")):
+            style = f"bold {MUTED}"
+        elif line.startswith("@@"):
+            style = "#6fb3c9"
+        elif line.startswith("+"):
+            style = SAGE
+        elif line.startswith("-"):
+            style = BRICK
+        else:
+            style = SAND
+        return Text(line, style=style, no_wrap=True)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_open_pr(self) -> None:
+        if self.pr.url:
+            asyncio.get_running_loop().run_in_executor(None, webbrowser.open, self.pr.url)
+
+    def action_reload(self) -> None:
+        if prinfo.gh_available():
+            self._load()
+
+
 HELP_KEYS = [
     ("n", "Home: start a new cloud session"),
     ("i", "Add a session by link or ID"),
     ("o / y", "Open on claude.ai / copy link"),
+    ("d", "Pull request: checks, files and diff"),
     ("t / c", "Teleport / set local checkout"),
     ("/", "Search sessions"),
     ("v", "Show or hide archived"),
@@ -363,6 +539,25 @@ class Chip(Button):
 # ---------------------------------------------------------------------- app
 
 
+def background(**options):
+    """@work for refreshes that update the main UI. If the app closes while one is in flight there's
+    nothing left to update, so that case ends quietly instead of crashing the exit."""
+
+    def decorate(method):
+        @functools.wraps(method)
+        async def guarded(self, *args, **kwargs):
+            try:
+                return await method(self, *args, **kwargs)
+            except NoMatches:
+                if self._closing or not self.screen_stack:
+                    return None
+                raise
+
+        return work(**options)(guarded)
+
+    return decorate
+
+
 class CloudSessionsApp(App):
     TITLE = "Cloud sessions"
     CSS = f"""
@@ -408,10 +603,15 @@ class CloudSessionsApp(App):
     #session-header {{ height: auto; padding: 1 0; border-bottom: hkey $panel; }}
     #transcript {{ height: 1fr; background: $background; border: none; padding: 1 0 0 0; scrollbar-size-vertical: 1; }}
     #activity {{ height: 1; color: {SAGE}; }}
+    #pr-bar {{ height: auto; padding: 0 0 1 0; }}
     #composer {{ margin: 0 0 1 0; border: tall $panel; background: $surface; }}
     #composer:focus {{ border: tall {CLAY}; }}
 
     #form, #choice {{ width: 76; height: auto; max-height: 90%; padding: 1 2; background: $surface; border: tall {CLAY}; }}
+    #prscreen {{ width: 96%; height: 92%; padding: 1 2; background: $surface; border: tall {CLAY}; }}
+    #pr-log {{ height: 1fr; background: $surface; }}
+    #pr-hint {{ height: 1; color: {MUTED}; margin-top: 1; }}
+    PullRequestScreen {{ align: center middle; }}
     #help {{ width: 64; height: auto; padding: 1 2; background: $surface; border: tall {CLAY}; }}
     #choices {{ height: auto; max-height: 16; background: $surface; border: none; padding: 0; }}
     #custom {{ margin-top: 1; }}
@@ -427,6 +627,7 @@ class CloudSessionsApp(App):
         Binding("n", "new_session", "New"),
         Binding("i", "add_session", "Add by link"),
         Binding("o", "open_web", "Open on web"),
+        Binding("d", "pull_request", "PR & diff"),
         Binding("t", "teleport", "Teleport"),
         Binding("y", "copy_link", "Copy link"),
         Binding("c", "set_checkout", "Checkout path", show=False),
@@ -462,11 +663,22 @@ class CloudSessionsApp(App):
         self.optimistic: dict[str, float] = {}
         self.frame = 0
         self.envs: list[Environment] = []
+        self.branches: dict[str, list[BranchStatus]] = {}  # per session: PRs and pushed branches
+        self.details: dict[str, Details] = {}  # per PR url: what gh adds (CI, files)
         self.draft = self._initial_draft()
         self._seeded = False
+        self._closing = False
         self.creating = False
         self._suppress_highlight = False
         self._after_tool = False
+
+    @property
+    def main(self):
+        """The base screen. App.query_one searches the top screen, which is a modal whenever one is open,
+        and background refreshes must keep updating the main UI underneath it."""
+        if not self.screen_stack:
+            raise NoMatches("the app is closing")
+        return self.screen_stack[0]
 
     # ------------------------------------------------------------------ layout
 
@@ -498,6 +710,7 @@ class CloudSessionsApp(App):
                             yield Static("enter starts the session · tab moves between settings · esc, then ? lists keys", id="hint")
                     with Vertical(id="convo"):
                         yield Static("", id="session-header")
+                        yield Static("", id="pr-bar")
                         yield RichLog(id="transcript", wrap=True, min_width=20)
                         yield Static("", id="activity")
                         yield Input(placeholder="Reply to this session", id="composer")
@@ -507,7 +720,7 @@ class CloudSessionsApp(App):
         self.register_theme(THEME)
         self.theme = "ccweb"
         name = welcome_name()
-        self.query_one("#welcome", Static).update(
+        self.main.query_one("#welcome", Static).update(
             Text.assemble(("✱ ", CLAY), (f"Welcome back, {name}" if name else "Welcome back", SAND))
         )
         self._render_header()
@@ -523,9 +736,11 @@ class CloudSessionsApp(App):
         self.set_interval(float(self.cfg["poll"]["sessions_seconds"]), self.refresh_sessions)
         self.set_interval(float(self.cfg["poll"]["events_seconds"]), self.refresh_events)
         self.set_interval(0.12, self._tick)
-        self.query_one("#prompt", Input).focus()
+        self.set_interval(15, self.refresh_selected_pr)
+        self.main.query_one("#prompt", Input).focus()
 
     async def on_unmount(self) -> None:
+        self._closing = True
         await self.api.aclose()
 
     def on_resize(self) -> None:
@@ -533,7 +748,7 @@ class CloudSessionsApp(App):
 
     # ------------------------------------------------------------------ data
 
-    @work(exclusive=True, group="sessions")
+    @background(exclusive=True, group="sessions")
     async def refresh_sessions(self) -> None:
         try:
             page = await self.api.list_sessions_page()
@@ -570,7 +785,7 @@ class CloudSessionsApp(App):
         self.sessions = merged
         self.loaded_once = True
         live = [s for s in remote if not s.archived]
-        waiting = sum(1 for s in live if status_kind(s, self.optimistic) == "needs_input" and s.unread)
+        waiting = sum(1 for s in live if status_kind(s, self.optimistic, self._pr_state(s.id)) == "needs_input" and s.unread)
         working = sum(1 for s in live if status_kind(s, self.optimistic) == "working")
         account = Text(f"{len(live)} sessions" if self.api_ok else "claude.ai not reachable")
         if waiting:
@@ -579,14 +794,79 @@ class CloudSessionsApp(App):
         if working:
             account.append(" · ", style=MUTED)
             account.append(f"{working} working", style=SAGE)
-        self.query_one("#account", Static).update(account)
+        self.main.query_one("#account", Static).update(account)
         self._seed_draft()
         self._render_list()
         self._render_attention()
         self._render_header()
         self._render_activity()
+        self.refresh_prs()
 
-    @work(exclusive=True, group="more")
+    def _pr_state(self, sid: str) -> str:
+        return best_pr_state(self.branches.get(sid, []))
+
+    @background(exclusive=True, group="prs")
+    async def refresh_prs(self) -> None:
+        """PR state for the newest sessions in one batched call, for the sidebar icons and the home page."""
+        if not self.api_ok:
+            return
+        recent = [s for s in by_recency(self.sessions.values()) if s.from_server and not s.archived][:40]
+        try:
+            found = await self.api.branch_statuses(recent)
+        except (ApiError, AuthError):
+            return  # PR info is a bonus; the rest of the app doesn't depend on it
+        selected = self.selected
+        for sid, statuses in found.items():
+            if sid != selected or sid not in self.branches:  # the open session gets richer data from its own refresh
+                self.branches[sid] = statuses
+        try:
+            self._render_list()
+            self._render_attention()
+            self._render_prbar()
+        except NoMatches:  # the app was closed while the request was in flight
+            pass
+
+    @background(exclusive=True, group="pr-selected")
+    async def refresh_selected_pr(self) -> None:
+        """The open session's PRs with review state, plus CI and files from gh for the live ones."""
+        sid = self.selected
+        session = self.sessions.get(sid or "")
+        if not sid or session is None or not session.from_server or not self.api_ok:
+            return
+        try:
+            found = await self.api.branch_statuses([session], review=True)
+        except (ApiError, AuthError):
+            return
+        self.branches[sid] = found.get(sid, [])
+        if prinfo.gh_available():
+            live = [s.pr for s in relevant(self.branches[sid]) if s.pr and s.pr.is_live][:3]
+            for pr in live:
+                self.details[pr.url] = await asyncio.to_thread(prinfo.gh_details, pr.url)
+        if self.selected == sid:
+            try:
+                self._render_prbar()
+                self._render_header()
+                self._update_row(sid)
+            except NoMatches:
+                pass
+
+    def _render_prbar(self) -> None:
+        bar = self.main.query_one("#pr-bar", Static)
+        shown = relevant(self.branches.get(self.selected or "", []))
+        if not shown:
+            bar.update("")
+            return
+        text = Text()
+        for index, status in enumerate(shown[:3]):
+            text.append("\n" if index else "")
+            text.append_text(pr_line(status, self.details.get(status.pr.url) if status.pr else None))
+        if len(shown) > 3:
+            text.append(f"\n+{len(shown) - 3} more", style=MUTED)
+        if any(s.pr for s in shown):
+            text.append("\nd shows checks and the diff", style=MUTED)
+        bar.update(text)
+
+    @background(exclusive=True, group="more")
     async def load_more(self) -> None:
         try:
             page = await self.api.list_sessions_page(after_id=self.cursor)
@@ -598,7 +878,7 @@ class CloudSessionsApp(App):
         self.visible_limit += PAGE
         self._merge_sessions([s for s in self.sessions.values() if s.from_server and s.id not in self.older])
 
-    @work(exclusive=True, group="events")
+    @background(exclusive=True, group="events")
     async def refresh_events(self) -> None:
         sid = self.selected
         if not sid or not self.api_ok:
@@ -637,7 +917,7 @@ class CloudSessionsApp(App):
             self._render_activity()
             self._update_row(sid)
 
-    @work(exclusive=True, group="envs")
+    @background(exclusive=True, group="envs")
     async def load_environments(self) -> None:
         try:
             envs = await self.api.list_environments()
@@ -672,7 +952,7 @@ class CloudSessionsApp(App):
     # ------------------------------------------------------------------ rendering
 
     def _banner(self, text: str | None) -> None:
-        banner = self.query_one("#banner", Static)
+        banner = self.main.query_one("#banner", Static)
         banner.update(text or "")
         banner.set_class(bool(text), "show")
 
@@ -689,17 +969,21 @@ class CloudSessionsApp(App):
         return by_recency(out)
 
     def _row(self, session: Session) -> Text:
-        glyph, colour, _ = describe_status(session, self.optimistic, self.frame)
+        pr_state = self._pr_state(session.id)
+        glyph, colour, _ = describe_status(session, self.optimistic, self.frame, pr_state)
+        kind = status_kind(session, self.optimistic, pr_state)
+        if pr_state and not session.unread and kind not in {"working", "failed", "archived"}:
+            glyph, colour = "⎇", PR_ICON_COLOURS.get(pr_state, MUTED)  # a seen session with a PR shows the PR, like the web
         row = Text(no_wrap=True)
         row.append(f"{glyph} ", style=colour)
         row.append(session.title or session.id, style=SAND)
-        width = self.query_one("#sessions", OptionList).size.width
+        width = self.main.query_one("#sessions", OptionList).size.width
         if width > 6:  # the list wraps long rows itself, so cut them with an ellipsis like the web does
             row.truncate(width - 3, overflow="ellipsis")
         return row
 
     def _render_list(self) -> None:
-        option_list = self.query_one("#sessions", OptionList)
+        option_list = self.main.query_one("#sessions", OptionList)
         visible = self._visible_sessions()
         filtering = bool(self.filter_text)
         shown = visible if filtering else visible[: self.visible_limit]
@@ -729,12 +1013,12 @@ class CloudSessionsApp(App):
         if session is None:
             return
         try:
-            self.query_one("#sessions", OptionList).replace_option_prompt(sid, self._row(session))
+            self.main.query_one("#sessions", OptionList).replace_option_prompt(sid, self._row(session))
         except Exception:  # row not on screen (filtered out, or not shown yet)
             pass
 
     def _attention_row(self, session: Session, width: int) -> Text:
-        glyph, colour, label = describe_status(session, self.optimistic, self.frame)
+        glyph, colour, label = describe_status(session, self.optimistic, self.frame, self._pr_state(session.id))
         detail = session.needs_action or session.summary
         right = f"{short_repo(session.repo)}  {ago(session.last_activity)}  ›".strip()
         left = Text(no_wrap=True)
@@ -751,8 +1035,9 @@ class CloudSessionsApp(App):
         return left
 
     def _render_attention(self) -> None:
-        option_list = self.query_one("#attention", OptionList)
-        rows = home_sessions(list(self.sessions.values()), self.optimistic)
+        option_list = self.main.query_one("#attention", OptionList)
+        pr_states = {sid: self._pr_state(sid) for sid in self.branches}
+        rows = home_sessions(list(self.sessions.values()), self.optimistic, pr_states=pr_states)
         width = max(50, option_list.size.width or self.size.width - 46)
         option_list.clear_options()
         if not rows:
@@ -764,14 +1049,14 @@ class CloudSessionsApp(App):
         option_list.add_options([Option(self._attention_row(s, width), id=s.id) for s in rows])
 
     def _render_header(self) -> None:
-        header = self.query_one("#session-header", Static)
+        header = self.main.query_one("#session-header", Static)
         session = self.sessions.get(self.selected or "")
         if session is None:
             self.sub_title = ""
             header.update("")
             return
         self.sub_title = session.title or session.id
-        glyph, colour, label = describe_status(session, self.optimistic, self.frame)
+        glyph, colour, label = describe_status(session, self.optimistic, self.frame, self._pr_state(session.id))
         text = Text()
         text.append(session.title or "Untitled session", style=f"bold {SAND}")
         text.append("\n")
@@ -804,7 +1089,7 @@ class CloudSessionsApp(App):
         header.update(text)
 
     def _render_activity(self) -> None:
-        activity = self.query_one("#activity", Static)
+        activity = self.main.query_one("#activity", Static)
         session = self.sessions.get(self.selected or "")
         if session is not None and status_kind(session, self.optimistic) == "working":
             activity.update(Text(f"{SPINNER[self.frame % len(SPINNER)]} Claude is working…", style=SAGE))
@@ -817,17 +1102,20 @@ class CloudSessionsApp(App):
         working = [s for s in self.sessions.values() if status_kind(s, self.optimistic) == "working"]
         if not working:
             return
-        self._render_activity()
-        for session in working:
-            self._update_row(session.id)
-        if self.selected in {s.id for s in working}:
-            self._render_header()
+        try:
+            self._render_activity()
+            for session in working:
+                self._update_row(session.id)
+            if self.selected in {s.id for s in working}:
+                self._render_header()
+        except NoMatches:
+            pass  # closing
 
     def _note(self, text: str) -> None:
-        self.query_one("#transcript", RichLog).write(Text(text, style=f"italic {MUTED}"))
+        self.main.query_one("#transcript", RichLog).write(Text(text, style=f"italic {MUTED}"))
 
     def _write_message(self, message: Message) -> None:
-        log = self.query_one("#transcript", RichLog)
+        log = self.main.query_one("#transcript", RichLog)
         if message.kind == "text" and self._after_tool:
             log.write(Text(""))
         self._after_tool = message.kind in {"tool_use", "tool_result"}
@@ -856,13 +1144,14 @@ class CloudSessionsApp(App):
     # ------------------------------------------------------------------ selection
 
     def _show(self, view: str) -> None:
-        self.query_one("#views", ContentSwitcher).current = view
+        self.main.query_one("#views", ContentSwitcher).current = view
 
     def _select(self, sid: str | None) -> None:
         if sid is None:
             self.selected = None
             self._show("home")
             self._render_header()
+            self._render_prbar()
             return
         self._show("convo")
         if sid == self.selected:
@@ -872,9 +1161,11 @@ class CloudSessionsApp(App):
         self.events_cursor = None
         self.events_error_for = None
         self._after_tool = False
-        self.query_one("#transcript", RichLog).clear()
+        self.main.query_one("#transcript", RichLog).clear()
         self._render_header()
         self._render_activity()
+        self._render_prbar()
+        self.refresh_selected_pr()
         if sid in self.sessions and not self.api_ok:
             self._note(
                 "The conversation can't be loaded because claude.ai isn't reachable. "
@@ -884,7 +1175,7 @@ class CloudSessionsApp(App):
         self.refresh_events()
 
     def _sync_highlight(self) -> None:
-        option_list = self.query_one("#sessions", OptionList)
+        option_list = self.main.query_one("#sessions", OptionList)
         if not self.selected:
             return
         try:
@@ -912,13 +1203,13 @@ class CloudSessionsApp(App):
             self.load_more()
         elif sid:
             self._select(sid)
-            self.query_one("#composer", Input).focus()
+            self.main.query_one("#composer", Input).focus()
 
     @on(OptionList.OptionSelected, "#attention")
     def _open_from_home(self, event: OptionList.OptionSelected) -> None:
         if event.option.id:
             self._select(event.option.id)
-            self.query_one("#composer", Input).focus()
+            self.main.query_one("#composer", Input).focus()
 
     @on(Input.Changed, "#search")
     def _search_changed(self, event: Input.Changed) -> None:
@@ -927,7 +1218,7 @@ class CloudSessionsApp(App):
 
     @on(Input.Submitted, "#search")
     def _search_done(self) -> None:
-        self.query_one("#sessions", OptionList).focus()
+        self.main.query_one("#sessions", OptionList).focus()
 
     # ------------------------------------------------------------------ new session form
 
@@ -970,13 +1261,13 @@ class CloudSessionsApp(App):
         return list(out.items())
 
     def _render_settings(self) -> None:
-        chips = {c.what: c for c in self.query("#settings Chip").results(Chip)}
+        chips = {c.what: c for c in self.main.query("#settings Chip").results(Chip)}
         chips["mode"].label = label_for(PERMISSION_MODES, self.draft["mode"])
         chips["model"].label = model_label(self.draft["model"])
         chips["effort"].label = label_for(EFFORTS, self.draft["effort"], "Default")
 
     async def _rebuild_chips(self) -> None:
-        row = self.query_one("#chips", Horizontal)
+        row = self.main.query_one("#chips", Horizontal)
         await row.remove_children()
         env = next((e for e in self.envs if e.id == self.draft["env"]), None)
         widgets: list[Chip] = [Chip(f"☁ {env.name if env else 'Choose environment'}", "env", tip="Environment")]
@@ -1069,7 +1360,7 @@ class CloudSessionsApp(App):
         if not branch:
             self.resolve_default_branch(repo)
 
-    @work(group="default-branch")
+    @background(group="default-branch")
     async def resolve_default_branch(self, repo: str) -> None:
         branch = await asyncio.to_thread(gitinfo.default_branch, repo)
         if not branch:
@@ -1079,7 +1370,7 @@ class CloudSessionsApp(App):
                 item["branch"] = branch
         self.call_later(self._rebuild_chips)  # not saved: only your own choices are remembered
 
-    @work(group="branches")
+    @background(group="branches")
     async def _pick_branch(self, index: int) -> None:
         repos = self.draft["repos"]
         if index >= len(repos):
@@ -1116,7 +1407,7 @@ class CloudSessionsApp(App):
         self.notify("Starting session…", timeout=2)
         self.create_session(prompt, json.loads(json.dumps(self.draft)))
 
-    @work(group="create")
+    @background(group="create")
     async def create_session(self, prompt: str, draft: dict) -> None:
         try:
             body = build_session_body(
@@ -1133,7 +1424,7 @@ class CloudSessionsApp(App):
             return
         finally:
             self.creating = False
-        self.query_one("#prompt", Input).value = ""
+        self.main.query_one("#prompt", Input).value = ""
         self._remember_created(sid, prompt, draft)
 
     def _remember_created(self, sid: str, prompt: str, draft: dict) -> None:
@@ -1185,7 +1476,7 @@ class CloudSessionsApp(App):
         self.notify("Sending…", timeout=2)
         self.send_message(session.id, text)
 
-    @work(group="send")
+    @background(group="send")
     async def send_message(self, sid: str, text: str) -> None:
         result = await asyncio.to_thread(claude_cli.send_followup, self.claude_bin, sid, text)
         if result.ok:
@@ -1196,14 +1487,14 @@ class CloudSessionsApp(App):
             self.refresh_events()
             return
         self.notify(f"Not sent: {result.error}", severity="error", timeout=12)
-        composer = self.query_one("#composer", Input)
+        composer = self.main.query_one("#composer", Input)
         if not composer.value:
             composer.value = text
 
     @on(Button.Pressed, "#new")
     def action_new_session(self) -> None:
         self._select(None)
-        self.query_one("#prompt", Input).focus()
+        self.main.query_one("#prompt", Input).focus()
 
     def action_add_session(self) -> None:
         form = FormScreen(
@@ -1284,15 +1575,35 @@ class CloudSessionsApp(App):
         self.notify("Back from teleport." if code == 0 else f"claude --teleport exited with {code}.")
 
     def action_search(self) -> None:
-        self.query_one("#search", Input).focus()
+        self.main.query_one("#search", Input).focus()
 
     def action_focus_sessions(self) -> None:
-        self.query_one("#sessions", OptionList).focus()
+        self.main.query_one("#sessions", OptionList).focus()
 
     def action_toggle_archived(self) -> None:
         self.show_archived = not self.show_archived
         self._render_list()
         self.notify("Showing archived sessions." if self.show_archived else "Hiding archived sessions.")
+
+    def action_pull_request(self) -> None:
+        session = self._current()
+        if session is None:
+            return
+        prs = [s.pr for s in relevant(self.branches.get(session.id, [])) if s.pr]
+        if not prs:
+            self.notify("No pull request found for this session.", severity="warning")
+            return
+        if len(prs) == 1:
+            self.push_screen(PullRequestScreen(prs[0], self.details.get(prs[0].url)))
+            return
+        options = [(pr.url, f"{pr.label} {pr.state}", pr.title) for pr in prs]
+
+        def chosen(url: str | None) -> None:
+            pr = next((p for p in prs if p.url == url), None)
+            if pr is not None:
+                self.push_screen(PullRequestScreen(pr, self.details.get(pr.url)))
+
+        self.push_screen(ChoiceScreen("Which pull request?", options), chosen)
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

@@ -14,6 +14,8 @@ A personal terminal client for your Claude Code cloud sessions, the ones at clau
 | Environments | `GET /v1/environment_providers` | Undocumented |
 | New session | `POST /v1/sessions`, the request `claude --cloud` itself sends | Undocumented, not yet confirmed end to end |
 | Teleport | `claude --teleport <id>` from your checkout | Documented |
+| PRs, branches | `POST /v1/code/github/get-batch-branch-status`, the call claude.ai's own sidebar makes | Undocumented |
+| CI checks, files, diff | `gh pr view` and `gh pr diff`, when the `gh` CLI is installed and signed in | Optional |
 | Working indicator | `status_bucket` and `session_status`; the open session is re-read every few seconds | Undocumented |
 | Open on web, copy link | `https://claude.ai/code/<id>` | — |
 
@@ -70,6 +72,20 @@ The sidebar is ordered by last activity, newest first, as on the web. A filled d
 
 **Creating sessions is unconfirmed end to end.** The request is modeled on what the `claude` CLI sends, and the form, payload and error handling are covered by tests. Only a real session can confirm the server accepts it. If it's rejected, the server's message appears in a notification and your prompt stays in the box.
 
+## Pull requests, CI and diffs
+
+Under an open conversation's header, a PR bar lists the pull requests the session opened, and any branch it pushed that has no PR yet:
+
+```
+⎇ owner/repo#525  Draft  +323 −29  CI ✓8  approved  Thread-safe bolus progress reporting
+```
+
+State, size, and the review decision come from the same batched endpoint the web sidebar uses. The sidebar uses it too: a session you've already seen shows a PR icon instead of the hollow dot (gray for open or draft, purple for merged, red for closed), and a session with a live PR counts as ready for review on the home page. Unread still wins over the PR icon, as on the web.
+
+That endpoint leaves CI results empty, so check counts come from the `gh` CLI. Press `d` for the full view: the PR summary, every check (failures first), the changed files and the whole diff, colored. In that view `o` opens the PR on GitHub, `r` reloads and `Esc` closes. Without `gh` (install it and run `gh auth login`), the bar still shows state and size, and the view says what's missing. The diff is cut at 4,000 lines.
+
+Both are looked up as the sessions refresh (every 30 seconds for the sidebar, every 15 for the open session), and only for your newest 40 sessions. A session that opened PRs in several repositories shows each one.
+
 ## Keys
 
 While the prompt box has focus (the home page opens that way), letters are typed into it. Press `Esc` first to use the shortcuts below, or `F1` for help from anywhere.
@@ -83,6 +99,7 @@ While the prompt box has focus (the home page opens that way), letters are typed
 | `i` | Add a session by its claude.ai/code link |
 | `o` | Open on claude.ai |
 | `y` | Copy link |
+| `d` | Pull request: checks, files and diff |
 | `t` | Teleport into the local checkout |
 | `c` | Set the local checkout used for teleport |
 | `/` | Search |

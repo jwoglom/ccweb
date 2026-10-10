@@ -5,9 +5,10 @@ from datetime import datetime, timedelta, timezone
 from rich.console import Console
 from textual.widgets import ContentSwitcher, Input, OptionList, RichLog, Static
 
-from ccweb import gitinfo
+from ccweb import gitinfo, prinfo
 from ccweb.api import Session
-from ccweb.app import ChoiceScreen, Chip, CloudSessionsApp, HelpScreen
+from ccweb.app import ChoiceScreen, Chip, CloudSessionsApp, HelpScreen, PullRequestScreen
+from ccweb.prinfo import BranchStatus, Check, Details, PullRequest
 from ccweb.claude_cli import create_session_interactive, send_followup
 from ccweb.config import load_config
 from ccweb.store import Store
@@ -48,6 +49,7 @@ def setup(tmp_path, monkeypatch, token="test-token"):
     monkeypatch.setattr(gitinfo, "local_repo", lambda cwd: "")
     monkeypatch.setattr(gitinfo, "default_branch", lambda repo: "main")
     monkeypatch.setattr(gitinfo, "list_branches", lambda repo: ["main", "dev", "feature/x"])
+    monkeypatch.setattr(prinfo, "gh_available", lambda: False)  # tests never shell out to the real gh
     cfg = load_config(str(tmp_path / "missing.toml"))
     app = CloudSessionsApp(cfg, store=Store(tmp_path / "state.json"))
     return server, calls, app
@@ -322,4 +324,91 @@ def test_new_session_error_keeps_the_prompt(tmp_path, monkeypatch):
             assert app.selected is None
 
     asyncio.run(run())
+    server.close()
+
+
+def test_pr_bar_checks_and_diff_screen(tmp_path, monkeypatch):
+    server, calls, app = setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(prinfo, "gh_available", lambda: True)
+    monkeypatch.setattr(
+        prinfo,
+        "gh_details",
+        lambda url: Details(
+            checks=[
+                Check("build", "success"),
+                Check("tests", "failure"),
+                Check("lint", "pending"),
+            ],
+            review="CHANGES_REQUESTED",
+            mergeable="MERGEABLE",
+            files=[("src/importer.py", 30, 2), ("tests/test_importer.py", 10, 1)],
+        ),
+    )
+    diff = "diff --git a/src/importer.py b/src/importer.py\n+++ b/src/importer.py\n@@ -1,2 +1,3 @@\n context\n+added line\n-removed line"
+    monkeypatch.setattr(prinfo, "gh_diff", lambda url, max_lines=4000: (diff, ""))
+
+    async def run():
+        async with app.run_test(size=(150, 45)) as pilot:
+            await wait_for(pilot, lambda: app.sessions)
+            app._select(NEEDS)
+            await wait_for(pilot, lambda: "example-org/example-repo#77" in plain(app.query_one("#pr-bar", Static)))
+            # CI comes from gh, since the web endpoint leaves checks empty; review state is the fresher gh one.
+            await wait_for(pilot, lambda: "CI" in plain(app.query_one("#pr-bar", Static)))
+            bar = plain(app.query_one("#pr-bar", Static))
+            assert "Draft" in bar and "+40 −3" in bar
+            assert "CI ✓1 ✗1 ◔1" in bar
+            assert "changes requested" in bar
+            assert "Fix flaky CGM import test" in bar
+            assert "d shows checks and the diff" in bar
+            header = plain(app.query_one("#session-header", Static))
+            assert "Needs input" in header  # a draft PR doesn't override a pending question
+
+            app.query_one("#sessions", OptionList).focus()
+            await pilot.press("d")
+            await wait_for(pilot, lambda: isinstance(app.screen, PullRequestScreen))
+            await wait_for(pilot, lambda: "added line" in "\n".join(l.text for l in app.screen.query_one("#pr-log", RichLog).lines))
+            text = "\n".join(l.text for l in app.screen.query_one("#pr-log", RichLog).lines)
+            assert "example-org/example-repo#77  Draft" in text
+            assert "into dev" in text and "mergeable" in text
+            # failures are listed before passes
+            assert text.index("✗ tests") < text.index("◔ lint") < text.index("✓ build")
+            assert "Files changed (2)" in text and "src/importer.py" in text
+            assert "+added line" in text and "-removed line" in text
+            await pilot.press("escape")
+            await wait_for(pilot, lambda: not isinstance(app.screen, PullRequestScreen))
+
+    asyncio.run(run())
+    server.close()
+
+
+def test_pr_state_drives_sidebar_icon_and_home(tmp_path, monkeypatch):
+    server, calls, app = setup(tmp_path, monkeypatch)
+
+    async def run():
+        async with app.run_test(size=(150, 45)) as pilot:
+            await wait_for(pilot, lambda: app.sessions and app.branches)
+            # Batched lookup: by session id, and by (repo, branch) for a branch with no PR yet.
+            assert app._pr_state(NEEDS) == "draft"
+            assert app._pr_state(RUNNING) == "merged"
+            assert app._pr_state(REVIEW) == ""
+            assert [s.branch for s in prinfo.relevant(app.branches[REVIEW])] == ["claude/other-work"]
+
+            quiet = Session(id="session_01Quiet", title="Quiet", status="idle", unread=False)
+            app.sessions[quiet.id] = quiet
+            for state, glyph, colour in (("draft", "⎇", "#b9b3a8"), ("merged", "⎇", "#a78bfa"), ("", "○", "#8f897f")):
+                app.branches[quiet.id] = (
+                    [BranchStatus("o/r", "b", True, 1, "main", PullRequest("o/r", 1, state=state))] if state else []
+                )
+                row = app._row(quiet)
+                assert row.plain.startswith(glyph + " ")
+                assert row.spans[0].style == colour
+            # unread beats the PR icon, as on the web
+            quiet.unread = True
+            app.branches[quiet.id] = [BranchStatus("o/r", "b", True, 1, "main", PullRequest("o/r", 1, state="merged"))]
+            assert app._row(quiet).plain.startswith("● ")
+
+    asyncio.run(run())
+    sent = [r for r in server.requests if r.get("path", "").startswith("/v1/code/github/get-batch-branch-status")]
+    assert sent and all(len(r["body"]["repo_branches"]) <= 50 for r in sent)
+    assert NEEDS in sent[0]["body"]["session_ids"] and sent[0]["body"]["discover_session_prs"] is True
     server.close()

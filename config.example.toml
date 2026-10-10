@@ -11,6 +11,7 @@ list_events = "GET /v1/sessions/{id}/events"
 get_session = "GET /v1/sessions/{id}"
 list_environments = "GET /v1/environment_providers"
 create_session = "POST /v1/sessions"
+branch_status = "POST /v1/code/github/get-batch-branch-status"   # PRs and branches per session
 timeout_seconds = 20
 
 [poll]
