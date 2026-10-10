@@ -18,7 +18,7 @@ from .config import data_dir
 class Store:
     def __init__(self, path: Path | None = None):
         self.path = path or data_dir() / "state.json"
-        self.data: dict = {"version": 1, "known": {}, "checkouts": {}}
+        self.data: dict = {"version": 1, "known": {}, "checkouts": {}, "prefs": {}}
         self.load()
 
     def load(self) -> None:
@@ -29,6 +29,7 @@ class Store:
         if isinstance(loaded, dict):
             self.data["known"] = dict(loaded.get("known") or {})
             self.data["checkouts"] = dict(loaded.get("checkouts") or {})
+            self.data["prefs"] = dict(loaded.get("prefs") or {})
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,4 +63,12 @@ class Store:
 
     def set_checkout(self, key: str, path: str) -> None:
         self.data["checkouts"][key] = path
+        self.save()
+
+    @property
+    def prefs(self) -> dict:
+        return self.data["prefs"]
+
+    def set_prefs(self, **values) -> None:
+        self.data["prefs"].update(values)
         self.save()

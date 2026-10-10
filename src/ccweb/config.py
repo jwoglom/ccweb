@@ -20,6 +20,9 @@ DEFAULTS: dict[str, Any] = {
         "send_org_header": True,
         "list_sessions": "GET /v1/sessions",
         "list_events": "GET /v1/sessions/{id}/events",
+        "get_session": "GET /v1/sessions/{id}",
+        "list_environments": "GET /v1/environment_providers",
+        "create_session": "POST /v1/sessions",
         "timeout_seconds": 20,
     },
     "poll": {"sessions_seconds": 30, "events_seconds": 5},
@@ -31,6 +34,21 @@ DEFAULTS: dict[str, Any] = {
         "environment_id": "",
     },
     "auth": {"keychain_service": "Claude Code-credentials"},
+    # Starting points for the new-session form. What you last used wins over these.
+    "new_session": {
+        "environment": "",  # environment name or ID; empty picks "Default", else the first one
+        "model": "claude-sonnet-5-5",
+        "effort": "medium",
+        "permission_mode": "auto",
+        # [label, id] pairs offered in the model picker, besides models your sessions already use.
+        "models": [
+            ["Fable 5.1", "claude-fable-5-1"],
+            ["Opus 5.5", "claude-opus-5-5"],
+            ["Opus 5.5 (1M context)", "claude-opus-5-5[1m]"],
+            ["Sonnet 5.5", "claude-sonnet-5-5"],
+            ["Haiku 5.5", "claude-haiku-5-5"],
+        ],
+    },
 }
 
 

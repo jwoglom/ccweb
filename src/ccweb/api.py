@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import secrets
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -150,6 +152,17 @@ class Session:
     branch: str = ""
     archived: bool = False
     from_server: bool = True
+    unread: bool = False
+    bucket: str = ""  # status_bucket: blocked, review_ready, completed, working, failed
+    category: str = ""  # post_turn_summary.status_category
+    needs_action: str = ""  # what Claude is waiting on, when it is waiting
+    summary: str = ""  # post_turn_summary.status_detail
+    model: str = ""
+    effort: str = ""
+    permission_mode: str = ""
+    environment_id: str = ""
+    environment_kind: str = ""
+    sources: list[tuple[str, str]] = field(default_factory=list)  # (owner/repo, base revision)
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -168,6 +181,12 @@ def normalize_session(obj: dict) -> Session | None:
         (obj[k] for k in ("title", "name", "summary") if isinstance(obj.get(k), str) and obj[k]), ""
     )
     repo, branch = _find_repo_and_branch(obj)
+    context = obj.get("session_context") if isinstance(obj.get("session_context"), dict) else {}
+    summary = obj.get("post_turn_summary") if isinstance(obj.get("post_turn_summary"), dict) else {}
+    sources = []
+    for source in context.get("sources") or []:
+        if isinstance(source, dict) and isinstance(source.get("url"), str):
+            sources.append((parse_repo(source["url"]), str(source.get("revision") or "")))
     archived = bool(obj.get("archived") or obj.get("archived_at")) or status.lower() == "archived"
     return Session(
         id=norm_id(raw_id),
@@ -178,6 +197,17 @@ def normalize_session(obj: dict) -> Session | None:
         repo=repo,
         branch=branch,
         archived=archived,
+        unread=bool(obj.get("unread")),
+        bucket=str(obj.get("status_bucket") or ""),
+        category=str(summary.get("status_category") or ""),
+        needs_action=str(summary.get("needs_action") or ""),
+        summary=str(summary.get("status_detail") or ""),
+        model=str(obj.get("configured_model") or context.get("model") or ""),
+        effort=str(context.get("effort_level") or ""),
+        permission_mode=str(obj.get("permission_mode") or context.get("permission_mode") or ""),
+        environment_id=str(obj.get("environment_id") or ""),
+        environment_kind=str(obj.get("environment_kind") or ""),
+        sources=sources,
         raw=obj,
     )
 
@@ -249,6 +279,98 @@ def normalize_events(payload: Any) -> list[Message]:
     return out
 
 
+@dataclass
+class Environment:
+    id: str
+    name: str
+    kind: str = ""
+
+
+def normalize_environment(obj: dict) -> Environment | None:
+    env_id = obj.get("environment_id") or obj.get("id")
+    if not isinstance(env_id, str) or not env_id:
+        return None
+    return Environment(id=env_id, name=str(obj.get("name") or env_id), kind=str(obj.get("kind") or ""))
+
+
+def branch_slug(prompt: str) -> str:
+    words = re.findall(r"[a-z0-9]+", prompt.lower())[:6]
+    return "-".join(words)[:30].strip("-") or "task"
+
+
+def build_session_body(
+    prompt: str,
+    environment_id: str,
+    repos: list[tuple[str, str]],
+    model: str = "",
+    effort: str = "",
+    permission_mode: str = "",
+    title: str = "",
+) -> dict:
+    """The body the claude CLI posts to create a cloud session.
+
+    `repos` is [(owner/repo, base branch or "" for the repo's default)]. Each repo
+    gets a source (what to clone) and an outcome branch (where Claude's work goes).
+    """
+    work_branch = f"claude/{branch_slug(prompt)}-{secrets.token_hex(3)}"
+    events: list[dict] = []
+    if permission_mode:
+        events.append(
+            {
+                "type": "event",
+                "data": {
+                    "type": "control_request",
+                    "request_id": f"set-mode-{uuid.uuid4()}",
+                    "request": {"subtype": "set_permission_mode", "mode": permission_mode},
+                },
+            }
+        )
+    events.append(
+        {
+            "type": "event",
+            "data": {
+                "uuid": str(uuid.uuid4()),
+                "session_id": "",
+                "type": "user",
+                "parent_tool_use_id": None,
+                "message": {"role": "user", "content": prompt},
+            },
+        }
+    )
+    context: dict = {
+        "sources": [
+            {"type": "git_repository", "url": f"https://github.com/{repo}", **({"revision": branch} if branch else {})}
+            for repo, branch in repos
+        ],
+        "outcomes": [
+            {"type": "git_repository", "git_info": {"type": "github", "repo": repo, "branches": [work_branch]}}
+            for repo, _ in repos
+        ],
+    }
+    if model:
+        context["model"] = model
+    if effort:
+        context["effort_level"] = effort
+    body: dict = {"title": title or prompt.strip().splitlines()[0][:80], "events": events, "session_context": context}
+    # Self-hosted runner pools use a different key than regular environments.
+    body["self_hosted_runner_pool_id" if environment_id.startswith("ccpool_") else "environment_id"] = environment_id
+    return body
+
+
+@dataclass
+class SessionPage:
+    sessions: list[Session]
+    has_more: bool = False
+    last_id: str | None = None
+
+
+@dataclass
+class EventPage:
+    messages: list[Message]
+    has_more: bool = False
+    last_id: str | None = None
+
+
 # --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
@@ -291,14 +413,18 @@ class CloudApi:
             headers["x-organization-uuid"] = self._org
         return headers
 
-    async def raw(self, endpoint_key: str, **params: str) -> tuple[int, Any, str, str]:
+    async def raw(
+        self, endpoint_key: str, *, query: dict | None = None, body: Any = None, **params: str
+    ) -> tuple[int, Any, str, str]:
         """Return (status, parsed JSON or text, method, path). Raises AuthError."""
         method, template = parse_endpoint(self.cfg["api"][endpoint_key])
         path = template.format(**{k: quote(v, safe="") for k, v in params.items()})
         resp = None
         for attempt in range(2):
             try:
-                resp = await self._client.request(method, path, headers=await self._headers())
+                resp = await self._client.request(
+                    method, path, headers=await self._headers(), params=query or None, json=body
+                )
             except httpx.HTTPError as exc:
                 raise ApiError(None, method, path, type(exc).__name__) from None
             if resp.status_code == 401 and attempt == 0:
@@ -313,28 +439,73 @@ class CloudApi:
             body = resp.text
         return resp.status_code, body, method, path
 
-    async def request(self, endpoint_key: str, **params: str) -> Any:
-        status, body, method, path = await self.raw(endpoint_key, **params)
+    async def request(self, endpoint_key: str, *, query: dict | None = None, body: Any = None, **params: str) -> Any:
+        status, body, method, path = await self.raw(endpoint_key, query=query, body=body, **params)
         if status >= 400:
             raise ApiError(status, method, path, _error_detail(body))
         if isinstance(body, str):
             raise ApiError(status, method, path, "response wasn't JSON")
         return body
 
-    async def list_sessions(self) -> list[Session]:
-        payload = await self.request("list_sessions")
+    async def list_sessions_page(self, after_id: str | None = None) -> SessionPage:
+        payload = await self.request("list_sessions", query={"after_id": after_id} if after_id else None)
         sessions = [normalize_session(o) for o in items(payload) if isinstance(o, dict)]
-        return [s for s in sessions if s is not None]
+        meta = payload if isinstance(payload, dict) else {}
+        last_id = meta.get("last_id") if isinstance(meta.get("last_id"), str) else None
+        return SessionPage([s for s in sessions if s is not None], meta.get("has_more") is True, last_id)
+
+    async def list_sessions(self) -> list[Session]:
+        return (await self.list_sessions_page()).sessions
+
+    async def get_session(self, session_id: str) -> Session | None:
+        payload = await self.request("get_session", id=session_id)
+        return normalize_session(payload) if isinstance(payload, dict) else None
+
+    async def list_events_page(self, session_id: str, after_id: str | None = None) -> EventPage:
+        """One page of events, oldest first. The server's default page is only 50 events."""
+        query: dict = {"limit": 500}
+        if after_id:
+            query["after_id"] = after_id
+        payload = await self.request("list_events", query=query, id=session_id)
+        meta = payload if isinstance(payload, dict) else {}
+        last_id = meta.get("last_id") if isinstance(meta.get("last_id"), str) else None
+        return EventPage(normalize_events(payload), meta.get("has_more") is True, last_id)
 
     async def list_events(self, session_id: str) -> list[Message]:
-        return normalize_events(await self.request("list_events", id=session_id))
+        return (await self.list_events_page(session_id)).messages
+
+    async def list_environments(self) -> list[Environment]:
+        out: list[Environment] = []
+        after_id = None
+        for _ in range(10):
+            query: dict = {"limit": 100}
+            if after_id:
+                query["after_id"] = after_id
+            payload = await self.request("list_environments", query=query)
+            rows = payload.get("environments") if isinstance(payload, dict) else None
+            out.extend(e for e in map(normalize_environment, rows or []) if e is not None)
+            after_id = payload.get("last_id") if isinstance(payload, dict) else None
+            if not (isinstance(payload, dict) and payload.get("has_more") is True and rows and after_id):
+                break
+        return out
+
+    async def create_session(self, body: dict) -> str:
+        """Create a cloud session; returns its ID. The request body mirrors what `claude --cloud` sends."""
+        payload = await self.request("create_session", body=body)
+        found = payload.get("id") if isinstance(payload, dict) else None
+        if not isinstance(found, str) and isinstance(payload, dict) and isinstance(payload.get("session"), dict):
+            found = payload["session"].get("id")
+        if not isinstance(found, str) or not found:
+            raise ApiError(None, "POST", "create_session", "the response didn't include a session ID")
+        return norm_id(found)
 
 
 def _error_detail(body: Any) -> str:
     if isinstance(body, dict):
         err = body.get("error")
         if isinstance(err, dict) and err.get("message"):
-            return str(err["message"])[:200]
+            reason = f" ({err['reason']})" if isinstance(err.get("reason"), str) else ""
+            return (str(err["message"]) + reason)[:240]
         if isinstance(body.get("message"), str):
             return body["message"][:200]
     text = str(body).strip().replace("\n", " ")
@@ -345,8 +516,10 @@ __all__ = [
     "ApiError",
     "AuthError",
     "CloudApi",
+    "Environment",
     "Message",
     "Session",
+    "build_session_body",
     "extract_session_id",
     "normalize_events",
     "normalize_session",
