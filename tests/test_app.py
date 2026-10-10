@@ -111,3 +111,19 @@ def test_send_and_create_via_cli(tmp_path):
     assert not missing.ok and "PATH" in missing.error
     code, sid = create_session_interactive(str(claude), "do a thing", str(tmp_path))
     assert code == 0 and sid == "session_01CreatedDDDDDD"
+
+
+def test_help_screen_opens_and_closes(tmp_path, monkeypatch):
+    server, calls, app = setup(tmp_path, monkeypatch)
+
+    async def run():
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("question_mark")
+            await pilot.pause(0.1)
+            assert app.screen.__class__.__name__ == "HelpScreen"
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert app.screen.__class__.__name__ != "HelpScreen"
+
+    asyncio.run(run())

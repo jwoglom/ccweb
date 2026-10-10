@@ -136,6 +136,42 @@ class FormScreen(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
+HELP_KEYS = [
+    ("n", "New cloud session"),
+    ("i", "Add a session by link or ID"),
+    ("o / y", "Open on claude.ai / copy link"),
+    ("t / c", "Teleport / set local checkout"),
+    ("/", "Search sessions"),
+    ("v", "Show or hide archived"),
+    ("r", "Refresh now"),
+    ("x", "Forget a locally saved session"),
+    ("esc", "Back to the session list"),
+    ("q", "Quit"),
+]
+
+
+class HelpScreen(ModalScreen[None]):
+    """Key reference."""
+
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("question_mark", "close", "Close")]
+
+    def compose(self) -> ComposeResult:
+        text = Text()
+        text.append("Keys\n\n", style=f"bold {SAND}")
+        for key, what in HELP_KEYS:
+            text.append(f"{key:<8}", style=f"bold {CLAY}")
+            text.append(f"{what}\n", style=SAND)
+        text.append("\nWhile typing a reply, enter sends and esc leaves the box.", style=MUTED)
+        with Vertical(id="help"):
+            yield Static(text)
+
+    def on_click(self) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class CloudSessionsApp(App):
     TITLE = "Cloud sessions"
     CSS = f"""
@@ -156,7 +192,14 @@ class CloudSessionsApp(App):
     #banner.show {{ display: block; }}
     #session-header {{ height: auto; padding: 1 0; border-bottom: hkey $panel; }}
     #transcript {{ height: 1fr; background: $background; border: none; padding: 1 0 0 0; scrollbar-size-vertical: 1; }}
-    #composer {{ margin: 1 0; }}
+    #composer {{ margin: 1 0; border: tall $panel; background: $surface; }}
+    #composer:focus {{ border: tall {CLAY}; }}
+    #search {{ border: tall $panel; background: $background; }}
+    #search:focus {{ border: tall {CLAY}; }}
+    #account {{ height: auto; }}
+    #brand {{ color: {CLAY}; }}
+    #help {{ width: 64; height: auto; padding: 1 2; background: $surface; border: tall {CLAY}; }}
+    HelpScreen {{ align: center middle; }}
     #form {{ width: 76; height: auto; padding: 1 2; background: $surface; border: tall {CLAY}; }}
     FormScreen {{ align: center middle; }}
     #form-heading {{ text-style: bold; margin-bottom: 1; }}
@@ -178,6 +221,7 @@ class CloudSessionsApp(App):
         Binding("r", "refresh", "Refresh", show=False),
         Binding("x", "forget", "Forget", show=False),
         Binding("escape", "focus_sessions", "Sessions", show=False),
+        Binding("question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -263,6 +307,11 @@ class CloudSessionsApp(App):
         live = sum(1 for s in remote if not s.archived)
         account = f"{live} on claude.ai" if self.api_ok else "claude.ai not reachable"
         self.query_one("#account", Static).update(account)
+        waiting = sum(1 for s in remote if not s.archived and s.status.lower() in NEEDS_INPUT)
+        if waiting:
+            self.query_one("#account", Static).update(
+                Text.assemble(account, ("  ·  ", MUTED), (f"{waiting} need you", AMBER))
+            )
         self._render_list()
         self._render_header()
 
@@ -343,12 +392,14 @@ class CloudSessionsApp(App):
             options.extend(Option(self._row(s), id=s.id) for s in members)
         visible_ids = [o.id for o in options if o.id]
         target = self.selected if self.selected in visible_ids else (visible_ids[0] if visible_ids else None)
+        scroll = option_list.scroll_y
         self._suppress_highlight = True
         try:
             option_list.clear_options()
             option_list.add_options(options)
             if target:
                 option_list.highlighted = option_list.get_option_index(target)
+            option_list.scroll_to(y=scroll, animate=False)
         finally:
             self._suppress_highlight = False
         if target and self.selected is None:
@@ -364,10 +415,11 @@ class CloudSessionsApp(App):
             header.update(
                 Text.assemble(
                     ("Pick a session on the left", f"bold {SAND}"),
-                    ("\nn starts a new cloud session in a local repo.  i adds one by its claude.ai/code link.", MUTED),
+                    ("\nn starts a new cloud session in a local repo.  i adds one by its claude.ai/code link.  ? shows all keys.", MUTED),
                 )
             )
             return
+        self.sub_title = session.title or session.id
         glyph, colour, label = describe_status(session)
         text = Text()
         text.append(session.title or "Untitled session", style=f"bold {SAND}")
@@ -397,7 +449,12 @@ class CloudSessionsApp(App):
                 log.write(Markdown(message.text))
             elif message.role == "user":
                 log.write(Text("You", style=f"bold {SAND}"))
-                log.write(Text(message.text, style=SAND))
+                bar = Text()
+                for i, line in enumerate(message.text.splitlines() or [""]):
+                    bar.append("\n" if i else "")
+                    bar.append("▎ ", style=CLAY)
+                    bar.append(line, style=SAND)
+                log.write(bar)
             else:
                 log.write(Text(f"{message.role}: {message.text}", style=MUTED))
             log.write(Text(""))
@@ -637,6 +694,9 @@ class CloudSessionsApp(App):
         self.show_archived = not self.show_archived
         self._render_list()
         self.notify("Showing archived sessions." if self.show_archived else "Hiding archived sessions.")
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     def action_refresh(self) -> None:
         self.refresh_sessions()
