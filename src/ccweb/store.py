@@ -18,7 +18,7 @@ from .config import data_dir
 class Store:
     def __init__(self, path: Path | None = None):
         self.path = path or data_dir() / "state.json"
-        self.data: dict = {"version": 1, "known": {}, "checkouts": {}, "prefs": {}, "groups": None}
+        self.data: dict = {"version": 1, "known": {}, "checkouts": {}, "prefs": {}, "ui": {}, "groups": None}
         self.load()
 
     def load(self) -> None:
@@ -30,6 +30,7 @@ class Store:
             self.data["known"] = dict(loaded.get("known") or {})
             self.data["checkouts"] = dict(loaded.get("checkouts") or {})
             self.data["prefs"] = dict(loaded.get("prefs") or {})
+            self.data["ui"] = dict(loaded.get("ui") or {})
             self.data["groups"] = loaded.get("groups") if isinstance(loaded.get("groups"), dict) else None
 
     def save(self) -> None:
@@ -72,6 +73,15 @@ class Store:
 
     def set_prefs(self, **values) -> None:
         self.data["prefs"].update(values)
+        self.save()
+
+    @property
+    def ui(self) -> dict:
+        """Layout choices, such as how wide the side panel is."""
+        return self.data["ui"]
+
+    def set_ui(self, **values) -> None:
+        self.data["ui"].update(values)
         self.save()
 
     @property

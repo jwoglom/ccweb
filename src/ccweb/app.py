@@ -45,13 +45,14 @@ from .api import (
     web_url,
 )
 from .groups import Group, Grouping
+from .keys import SHORTCUTS, ActionCommands, key_label
 from .links import LinkContext, is_openable, link_style, linkify_markdown, linkify_text
 from .prinfo import BranchStatus, Check, Details, PullRequest, best_pr_state, check_counts, ref_key, relevant
 from .panes import ChangesPane, FilesPane, PlanPane
 from .repoinfo import ChangedFile, Comparison, Target, gh_commit_files, gh_compare, gh_file, gh_tree, targets_for
 from .store import Store
 from .tasks import TaskBoard
-from .widgets import Chip
+from .widgets import Chip, Splitter
 
 from .palette import AMBER, BLUE, BRICK, CLAY, MUTED, PURPLE, SAGE, SAND  # noqa: F401  (re-exported for tests)
 PR_COLOURS = {"open": SAGE, "draft": MUTED, "merged": PURPLE, "closed": BRICK}
@@ -714,21 +715,11 @@ class PullRequestScreen(ModalScreen[None]):
 
 
 HELP_KEYS = [
-    ("n", "Home: start a new cloud session"),
-    ("i", "Add a session by link or ID"),
-    ("m", "Session menu (also: right-click, or the ⋮ button)"),
-    ("o / y", "Open on claude.ai / copy link"),
-    ("d / f / p", "Panels on the right: Changes, Files, Plan (z expands)"),
-    ("D", "Pull request summary and CI checks"),
-    ("t / c", "Teleport / set local checkout"),
-    ("/", "Search sessions"),
-    ("v", "Show or hide archived"),
-    ("g", "Show or hide groups (made with m > Move to group)"),
-    ("r", "Refresh now"),
-    ("x", "Forget a locally saved session"),
-    ("esc", "Back to the session list"),
-    ("q", "Quit (ctrl+q works anywhere)"),
-    ("f1", "This help, even while typing"),
+    *((s.key, s.label) for s in SHORTCUTS if s.key and s.action not in {"help", "quit"}),
+    ("ctrl+p", "Every action, searchable (see below)"),
+    ("f1", "This help"),
+    ("ctrl+q", "Quit"),
+    ("esc", "Leave the box; ↑ ↓ then move between sessions"),
     ("drag", "Select text; ctrl+c copies it"),
     ("click", "Open a link (URLs, owner/repo#123)"),
 ]
@@ -739,7 +730,6 @@ class HelpScreen(ModalScreen[None]):
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
-        Binding("question_mark", "close", "Close"),
         Binding("f1", "close", "Close"),
     ]
 
@@ -749,8 +739,11 @@ class HelpScreen(ModalScreen[None]):
         for key, what in HELP_KEYS:
             text.append(f"{key:<8}", style=f"bold {CLAY}")
             text.append(f"{what}\n", style=SAND)
+        text.append("\nEvery shortcut uses ctrl, so you can keep typing in the box.", style=MUTED)
+        text.append("\nOnly in ctrl+p: ", style=MUTED)
+        text.append("; ".join(s.label for s in SHORTCUTS if not s.key) + ".", style=MUTED)
         text.append("\nOn the home page, tab moves between the settings chips and enter starts the session.", style=MUTED)
-        text.append("\nWhile typing a reply, enter sends and esc leaves the box.", style=MUTED)
+        text.append("\nWhile typing a reply, enter sends.", style=MUTED)
         with Vertical(id="help"):
             yield Static(text)
 
@@ -789,6 +782,9 @@ def background(**options):
         return work(**options)(guarded)
 
     return decorate
+
+
+SIDE_MIN, MAIN_MIN = 30, 30  # the narrowest the side panel and the conversation can be dragged to, in cells
 
 
 class CloudSessionsApp(App):
@@ -835,8 +831,10 @@ class CloudSessionsApp(App):
 
     #convo {{ height: 1fr; }}
     #convo-main {{ width: 1fr; }}
-    #side {{ display: none; width: 58%; border-left: tall $panel; padding: 0 0 0 1; }}
-    #side.max {{ width: 100%; border-left: none; padding: 0; }}
+    #side {{ display: none; width: 58%; padding: 0 0 0 1; }}
+    #side.max {{ width: 100%; padding: 0; }}
+    Splitter {{ display: none; width: 1; height: 1fr; color: $panel; }}
+    Splitter:hover, Splitter.dragging {{ color: {CLAY}; }}
     PlanPane, FilesPane, ChangesPane {{ display: none; }}
     PlanPane {{ height: auto; max-height: 45%; margin-bottom: 1; }}
     FilesPane, ChangesPane {{ height: 1fr; }}
@@ -869,7 +867,7 @@ class CloudSessionsApp(App):
     #transcript Markdown MarkdownBlock {{ color: {SAND}; }}
     #transcript Markdown MarkdownFence {{ background: $surface; }}
     #activity {{ height: 1; color: {SAGE}; }}
-    #context-bar {{ height: auto; padding: 0 1; }}
+    #context-bar {{ height: auto; padding: 0 1; border-top: hkey $panel; }}
     #composer {{ margin: 0 0 1 0; border: tall $panel; background: $surface; }}
     #composer:focus {{ border: tall {CLAY}; }}
 
@@ -896,28 +894,11 @@ class CloudSessionsApp(App):
     #form-buttons Button {{ margin-left: 2; }}
     """
 
+    COMMANDS = App.COMMANDS | {ActionCommands}  # ctrl+p lists every action, including those with no key
+
     BINDINGS = [
-        Binding("n", "new_session", "New"),
-        Binding("i", "add_session", "Add by link"),
-        Binding("o", "open_web", "Open on web"),
-        Binding("m", "session_menu", "Menu"),
-        Binding("d", "toggle_changes", "Changes"),
-        Binding("f", "toggle_files", "Files"),
-        Binding("p", "toggle_plan", "Plan"),
-        Binding("z", "toggle_side_max", "Expand panel", show=False),
-        Binding("D", "pull_request", "PR checks", show=False),
-        Binding("t", "teleport", "Teleport"),
-        Binding("y", "copy_link", "Copy link"),
-        Binding("c", "set_checkout", "Checkout path", show=False),
-        Binding("slash", "search", "Search"),
-        Binding("v", "toggle_archived", "Archived"),
-        Binding("g", "toggle_groups", "Groups"),
-        Binding("r", "refresh", "Refresh", show=False),
-        Binding("x", "forget", "Forget", show=False),
+        *(Binding(s.key, s.action, s.footer or s.label, show=bool(s.footer), priority=s.priority) for s in SHORTCUTS if s.key),
         Binding("escape", "focus_sessions", "Sessions", show=False),
-        Binding("question_mark", "help", "Help"),
-        Binding("f1", "help", "Help", show=False),
-        Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self, cfg: dict, store: Store | None = None):
@@ -949,6 +930,7 @@ class CloudSessionsApp(App):
         self.details: dict[str, Details] = {}  # per PR url: what gh adds (CI, files)
         self.side_open = {"plan": False, "files": False, "changes": False}
         self.side_max = False
+        self.side_pct = self._saved_side_width()  # how wide the panel is, as a percentage of the conversation area
         self.target_idx: dict[str, int] = {}  # per session: which comparison the Changes and Files panels show
         self.changes_commit: str | None = None  # a single commit picked in Changes, or None for all changes
         self.cmp_cache: dict[tuple, tuple[float, Comparison]] = {}
@@ -999,19 +981,20 @@ class CloudSessionsApp(App):
                                 yield Static("", id="settings-spacer")
                                 yield Chip("", "model", classes="plain", tip="Model")
                                 yield Chip("", "effort", classes="plain", tip="Effort")
-                            yield Static("enter starts the session · tab moves between settings · esc, then ? lists keys", id="hint")
+                            yield Static("enter starts the session · tab moves between settings · F1 lists keys · ctrl+p lists actions", id="hint")
                     with Horizontal(id="convo"):
                         with Vertical(id="convo-main"):
                             with Horizontal(id="header-row"):
                                 yield Static("", id="session-header")
-                                yield Chip("±", "toggle:changes", tip="Changes: files, commits and diffs (d)", classes="plain")
-                                yield Chip("▤", "toggle:files", tip="Files in the repository (f)", classes="plain")
-                                yield Chip("✓", "toggle:plan", tip="Plan: Claude's task list (p)", classes="plain")
-                                yield Chip("⋮", "menu", classes="plain", tip="Session menu (m, or right-click a session)")
+                                yield Chip("±", "toggle:changes", tip=f"Changes: files, commits and diffs ({key_label('toggle_changes')})", classes="plain")
+                                yield Chip("▤", "toggle:files", tip=f"Files in the repository ({key_label('toggle_files')})", classes="plain")
+                                yield Chip("✓", "toggle:plan", tip=f"Plan: Claude's task list ({key_label('toggle_plan')})", classes="plain")
+                                yield Chip("⋮", "menu", classes="plain", tip=f"Session menu ({key_label('session_menu')}, or right-click a session)")
                             yield VerticalScroll(id="transcript")
                             yield Static("", id="activity")
                             yield Static("", id="context-bar")
                             yield Input(placeholder="Reply to this session", id="composer")
+                        yield Splitter(id="splitter")
                         with Vertical(id="side"):
                             yield PlanPane(id="pane-plan")
                             yield FilesPane(id="pane-files")
@@ -1683,7 +1666,8 @@ class CloudSessionsApp(App):
         if sid in self.sessions and not self.api_ok:
             self._note(
                 "The conversation can't be loaded because claude.ai isn't reachable. "
-                "You can still reply below, teleport (t) or open it on the web (o)."
+                f"You can still reply below, teleport ({key_label('teleport')}) or open it on the web "
+                f"({key_label('session_menu')}, then Open in)."
             )
         self._sync_highlight()
         self.refresh_events()
@@ -2144,7 +2128,7 @@ class CloudSessionsApp(App):
     def _teleport(self, session: Session) -> None:
         checkout = self._checkout(session)
         if not checkout:
-            self.notify("Set the local checkout first (press c).", severity="warning")
+            self.notify('Set the local checkout first: ctrl+p, then type "checkout".', severity="warning")
             return
         try:
             with self.suspend():
@@ -2503,6 +2487,28 @@ class CloudSessionsApp(App):
         self.side_open[name] = False
         self._apply_side()
 
+    def _saved_side_width(self) -> float | None:
+        saved = self.store.ui.get("side_width")
+        return float(saved) if isinstance(saved, (int, float)) and 10 <= saved <= 90 else None
+
+    def _apply_side_width(self) -> None:
+        side = self.main.query_one("#side")
+        side.styles.width = f"{self.side_pct}%" if self.side_pct and not self.side_max else None  # None: the stylesheet's
+
+    @on(Splitter.Dragged)
+    def _drag_side(self, event: Splitter.Dragged) -> None:
+        convo = self.main.query_one("#convo")
+        total = convo.size.width
+        cells = convo.region.right - event.screen_x - 1  # the handle takes one cell
+        cells = max(SIDE_MIN, min(cells, total - 1 - MAIN_MIN))
+        self.side_pct = round(100 * cells / total, 1)
+        self._apply_side_width()
+
+    @on(Splitter.Released)
+    def _keep_side_width(self) -> None:
+        if self.side_pct:
+            self.store.set_ui(side_width=self.side_pct)
+
     def _apply_side(self) -> None:
         opened = any(self.side_open.values())
         if not opened:
@@ -2510,6 +2516,8 @@ class CloudSessionsApp(App):
         side = self.main.query_one("#side")
         side.display = opened
         side.set_class(self.side_max, "max")
+        self._apply_side_width()
+        self.main.query_one("#splitter").display = opened and not self.side_max
         self.main.query_one("#convo-main").display = not (opened and self.side_max)
         for name, is_open in self.side_open.items():
             self.main.query_one(f"#pane-{name}").display = is_open

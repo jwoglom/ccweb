@@ -155,7 +155,7 @@ class PaneHead(Horizontal):
     def compose(self) -> ComposeResult:
         yield Static(self._title, classes="pane-title")
         yield from self._extra
-        yield Chip("⤢", "side-max", tip="Expand or restore the panel (z)", classes="plain")
+        yield Chip("⤢", "side-max", tip="Expand or restore the panel", classes="plain")
         yield Chip("×", f"pane-close:{self._name}", tip="Close", classes="plain")
 
 

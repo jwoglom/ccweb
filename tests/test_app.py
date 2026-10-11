@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from rich.console import Console
+from textual.command import CommandList, CommandPalette
 from textual.widgets import Button, ContentSwitcher, Input, Markdown, OptionList, Static
 
 from ccweb import gitinfo, prinfo
@@ -74,6 +75,17 @@ async def wait_for(pilot, condition, tries=80):
     raise AssertionError("timed out waiting for condition")
 
 
+async def from_palette(pilot, app, query):
+    """Run an action the way someone would without a key for it: ctrl+p, type a few words, enter."""
+    await pilot.press("ctrl+p")
+    await wait_for(pilot, lambda: isinstance(app.screen, CommandPalette))
+    await pilot.press(*query)
+    first = lambda: next(iter(app.screen.query_one(CommandList).options), None)
+    await wait_for(pilot, lambda: first() is not None and query.lower().split()[0] in first().hit.text.lower())
+    await pilot.press("enter")
+    await wait_for(pilot, lambda: not isinstance(app.screen, CommandPalette))
+
+
 def test_lists_reads_and_replies(tmp_path, monkeypatch):
     server, calls, app = setup(tmp_path, monkeypatch)
 
@@ -132,8 +144,7 @@ def test_lists_reads_and_replies(tmp_path, monkeypatch):
             # After a reply the session shows as working until the server says otherwise.
             await wait_for(pilot, lambda: "working" in plain(app.query_one("#activity", Static)).lower())
 
-            await pilot.press("escape")
-            await pilot.press("v")
+            await from_palette(pilot, app, "archived")  # typing in the box never has to stop for this
             await pilot.pause(0.1)
             assert ARCHIVED in sidebar_ids(app)
             app.save_screenshot(str(tmp_path / "shot.svg"))
@@ -214,7 +225,7 @@ def test_help_screen_opens_and_closes(tmp_path, monkeypatch):
             assert isinstance(app.screen, HelpScreen)
             await pilot.press("escape")
             await pilot.pause(0.1)
-            await pilot.press("escape", "question_mark")  # esc leaves the prompt, then ? opens help
+            await pilot.press("escape", "f1")  # and from the session list
             await pilot.pause(0.1)
             assert isinstance(app.screen, HelpScreen)
             await pilot.press("escape")
@@ -387,8 +398,7 @@ def test_pr_bar_checks_and_diff_screen(tmp_path, monkeypatch):
             assert "Needs input" in header  # a draft PR doesn't override a pending question
             assert "example-org/example-repo#77" not in header  # PRs are above the text box too
 
-            app.query_one("#sessions", OptionList).focus()
-            await pilot.press("D")  # shift+d: the PR summary and CI checks (plain d is the Changes panel)
+            await from_palette(pilot, app, "pull request")  # the PR summary and CI checks
             await wait_for(pilot, lambda: isinstance(app.screen, PullRequestScreen))
             await wait_for(pilot, lambda: "added line" in app.screen.plain_text())
             text = app.screen.plain_text()
@@ -453,14 +463,14 @@ def test_menu_rename_mark_read_and_copy(tmp_path, monkeypatch):
     async def run():
         async with app.run_test(size=(150, 45)) as pilot:
             await wait_for(pilot, lambda: app.sessions)
-            # m opens the menu for the highlighted sidebar row
+            # ctrl+o opens the menu for the highlighted sidebar row
             app.query_one("#sessions", OptionList).focus()
             for _ in range(4):
                 await pilot.press("down")
                 await pilot.pause(0.05)
                 if app.selected == NEEDS:
                     break
-            await pilot.press("m")
+            await pilot.press("ctrl+o")
             await wait_for(pilot, lambda: isinstance(app.screen, MenuScreen))
             assert app.screen.heading == "Fix flaky CGM import test"
             enabled = {i.id: i.enabled for i in app.screen.items if i}
@@ -620,7 +630,7 @@ def test_links_open_on_click_and_text_can_be_selected(tmp_path, monkeypatch):
             bar = app.query_one("#context-bar", Static)
             lines = str(bar.render()).splitlines()
             y = next(i for i, r in enumerate(lines) if "example-org/example-repo#77" in r)
-            await pilot.click(bar, offset=(lines[y].index("example-org") + 2, y))
+            await pilot.click(bar, offset=(lines[y].index("example-org") + 2, y + 1))  # +1 for the divider above
             await wait_for(pilot, lambda: opened[-1] == "https://github.com/example-org/example-repo/pull/77")
             # a href that isn't a web link is never followed
             before = len(opened)
@@ -759,11 +769,11 @@ def test_groups_pins_and_collapsing(tmp_path, monkeypatch):
             app.filter_text = ""
             app._render_list()
 
-            # g shows one flat list and brings the groups back
-            await pilot.press("g")
+            # the palette shows one flat list and brings the groups back
+            await from_palette(pilot, app, "groups")
             assert header_ids(app) == [REVIEW, NEEDS, RUNNING] and not app.group_view
             assert app.query_one("#list-heading", Static).display
-            await pilot.press("g")
+            await from_palette(pilot, app, "groups")
             assert app.group_view and alpha_id in header_ids(app)
 
     asyncio.run(run())
@@ -794,11 +804,11 @@ def test_group_menu_rename_delete_and_right_click(tmp_path, monkeypatch):
             await wait_for(pilot, lambda: app.store.grouping.groups[0].name == "Renamed")
             assert str(options.get_option_at_index(0).prompt).startswith("▾ Renamed")
 
-            # m on a highlighted header does the same; a name that's taken is refused
+            # ctrl+o on a highlighted header does the same; a name that's taken is refused
             await move_to_new_group(pilot, app, RUNNING, "Other")
             options.focus()
             options.highlighted = options.get_option_index(f"__grp__:{app.store.grouping.groups[1].id}")
-            await pilot.press("m")
+            await pilot.press("ctrl+o")
             await wait_for(pilot, lambda: isinstance(app.screen, MenuScreen) and app.screen.heading == "Other")
             await pilot.press("r")
             await wait_for(pilot, lambda: isinstance(app.screen, FormScreen))
@@ -904,7 +914,7 @@ def test_changes_panel_tree_diff_commits_and_layout(tmp_path, monkeypatch):
             side = app.query_one("#side")
             assert not side.display and not app.query_one("#pane-changes").display
             app.query_one("#sessions", OptionList).focus()
-            await pilot.press("d")
+            await pilot.press("ctrl+g")
             pane = app.query_one("#pane-changes", ChangesPane)
             await wait_for(pilot, lambda: len(leaves(pane.query_one("#changes-tree"))) == 2)
             assert side.display and pane.display and not app.query_one("#pane-files").display and not app.query_one("#pane-plan").display
@@ -947,11 +957,11 @@ def test_changes_panel_tree_diff_commits_and_layout(tmp_path, monkeypatch):
             await pilot.pause(0.3)
             assert count["compare"] == before == 1
 
-            # z fills the window with the panel, and z again restores the conversation
+            # expanding fills the window with the panel, and doing it again restores the conversation
             app.query_one("#sessions", OptionList).focus()
-            await pilot.press("z")
+            await from_palette(pilot, app, "expand")
             assert side.has_class("max") and not app.query_one("#convo-main").display
-            await pilot.press("z")
+            await from_palette(pilot, app, "expand")
             assert not side.has_class("max") and app.query_one("#convo-main").display
 
             # the × button closes it, and with nothing open the panel goes away
@@ -974,7 +984,7 @@ def test_files_panel_search_and_open(tmp_path, monkeypatch):
             app._select(NEEDS)
             await wait_for(pilot, lambda: app.branches.get(NEEDS))
             app.query_one("#sessions", OptionList).focus()
-            await pilot.press("f")
+            await pilot.press("ctrl+f")
             pane = app.query_one("#pane-files", FilesPane)
             tree = pane.query_one("#files-tree")
             await wait_for(pilot, lambda: len(leaves(tree)) == 4)
@@ -992,7 +1002,7 @@ def test_files_panel_search_and_open(tmp_path, monkeypatch):
             assert count["file"] == 1 and count["tree"] == 1
 
             # Files and Changes can be open together, stacked, as on the web
-            await pilot.press("d")
+            await pilot.press("ctrl+g")
             await wait_for(pilot, lambda: app.query_one("#pane-changes").display)
             assert app.query_one("#pane-files").display and app.query_one("#pane-changes").display
 
@@ -1012,7 +1022,7 @@ def test_plan_panel_and_no_branch_message(tmp_path, monkeypatch):
             plan_chip = next(c for c in app.query(Chip) if c.what == "toggle:plan")
             assert str(plan_chip.label) == "✓ 1/3"  # progress shows even with the panel closed
             app.query_one("#sessions", OptionList).focus()
-            await pilot.press("p")
+            await pilot.press("ctrl+l")
             pane = app.query_one("#pane-plan", PlanPane)
             assert pane.display and app.query_one("#side").display
             text = static_text(pane.query_one("#plan-body"))
@@ -1020,7 +1030,7 @@ def test_plan_panel_and_no_branch_message(tmp_path, monkeypatch):
             assert "◐ Adding tests" in text and "cover the edge cases" in text  # the one in progress shows its active form
             assert "○ Ship it" in text
             # Plan over Changes, the combination in the web's layout
-            await pilot.press("d")
+            await pilot.press("ctrl+g")
             await wait_for(pilot, lambda: app.query_one("#pane-changes").display)
             assert pane.display and app.query_one("#pane-changes").display and not app.query_one("#pane-files").display
 
@@ -1082,3 +1092,134 @@ def test_failed_send_removes_the_message_and_restores_the_text(tmp_path, monkeyp
 
     asyncio.run(run())
     server.close()
+
+
+def test_side_panel_width_is_draggable_and_remembered(tmp_path, monkeypatch):
+    server, calls, app = setup(tmp_path, monkeypatch)
+    stub_repo(monkeypatch)
+
+    async def run():
+        async with app.run_test(size=(170, 50)) as pilot:
+            await wait_for(pilot, lambda: app.sessions)
+            app._select(NEEDS)
+            await wait_for(pilot, lambda: app.branches.get(NEEDS))
+            side, splitter = app.query_one("#side"), app.query_one("#splitter")
+            assert not splitter.display  # nothing to resize until a panel is open
+            app.toggle_pane("changes")
+            await pilot.pause(0.2)
+            assert splitter.display and 68 <= side.region.width <= 72  # starts at 58% of the 124-cell conversation area
+            right = app.query_one("#convo").region.right
+
+            # dragging the handle left widens the panel, and right narrows it
+            x = splitter.region.x
+            await pilot.mouse_down(splitter)
+            await pilot.hover(None, offset=(x - 15, 10))
+            await pilot.pause(0.1)
+            assert 84 <= side.region.width <= 88 and side.region.right == right
+            await pilot.hover(None, offset=(x + 20, 10))
+            await pilot.pause(0.1)
+            assert 49 <= side.region.width <= 53
+            await pilot.mouse_up(None, offset=(x + 20, 10))
+            await pilot.pause(0.1)
+            assert app.store.ui["side_width"] == app.side_pct
+
+            # neither side can be dragged out of existence
+            await pilot.mouse_down(splitter)
+            await pilot.hover(None, offset=(0, 10))
+            await pilot.mouse_up(None, offset=(0, 10))
+            await pilot.pause(0.1)
+            assert app.query_one("#convo-main").region.width >= 30
+            await pilot.mouse_down(splitter)
+            await pilot.hover(None, offset=(169, 10))
+            await pilot.mouse_up(None, offset=(169, 10))
+            await pilot.pause(0.1)
+            assert side.region.width >= 30
+
+            # the expanded view fills the window whatever width was chosen, then goes back to it
+            app.action_toggle_side_max()
+            await pilot.pause(0.1)
+            assert side.region.width == app.query_one("#convo").region.width and not splitter.display
+            app.action_toggle_side_max()
+            await pilot.pause(0.1)
+            assert splitter.display and abs(side.region.width - round(app.side_pct * 124 / 100)) <= 1
+
+    asyncio.run(run())
+    server.close()
+
+    # a later run starts at the saved width
+    server, _, again = setup(tmp_path, monkeypatch)
+    assert again.side_pct == app.side_pct
+    server.close()
+
+
+def test_shortcuts_need_ctrl_so_the_text_box_keeps_focus(tmp_path, monkeypatch):
+    server, calls, app = setup(tmp_path, monkeypatch)
+    stub_repo(monkeypatch)
+
+    async def run():
+        async with app.run_test(size=(170, 50)) as pilot:
+            await wait_for(pilot, lambda: app.sessions)
+            app._select(NEEDS)
+            await wait_for(pilot, lambda: app.branches.get(NEEDS))
+            composer = app.query_one("#composer", Input)
+            composer.focus()
+
+            # every old shortcut letter, and a capital D, is just text
+            await pilot.press(*"nimdfpztycvgrxoD/q?")
+            assert composer.value == "nimdfpztycvgrxoD/q?" and app.focused is composer
+            assert app.selected == NEEDS and not app.query_one("#side").display
+            assert not isinstance(app.screen, (HelpScreen, MenuScreen))
+
+            # with ctrl they act, and the box keeps its focus and its text
+            await pilot.press("ctrl+g")
+            await wait_for(pilot, lambda: app.query_one("#pane-changes").display)
+            await pilot.press("ctrl+f")
+            await pilot.press("ctrl+l")
+            assert all(app.side_open.values())
+            assert app.focused is composer and composer.value == "nimdfpztycvgrxoD/q?"
+            await pilot.press("ctrl+g", "ctrl+f", "ctrl+l")
+            assert not any(app.side_open.values())
+
+            await pilot.press("ctrl+o")  # the session menu
+            await wait_for(pilot, lambda: isinstance(app.screen, MenuScreen))
+            await pilot.press("escape")
+            await wait_for(pilot, lambda: not isinstance(app.screen, MenuScreen))
+            assert app.focused is composer
+
+            await pilot.press("ctrl+s")  # search moves focus on purpose
+            assert app.focused is app.query_one("#search")
+            await pilot.press("escape")
+            assert app.focused is app.query_one("#sessions")
+
+            composer.focus()
+            await pilot.press("ctrl+n")  # home page, with its box ready to type into
+            await wait_for(pilot, lambda: app.selected is None)
+            assert app.focused is app.query_one("#prompt")
+            await pilot.press(*"hello")
+            assert app.query_one("#prompt", Input).value == "hello"
+
+            # the divider between the conversation and what's above the reply box
+            app._select(NEEDS)
+            await pilot.pause(0.2)
+            bar = app.query_one("#context-bar")
+            assert bar.styles.border_top[0] == "hkey"
+            assert app.query_one("#activity").region.bottom <= bar.region.y
+
+            # the help screen and the footer name the same keys
+            await pilot.press("f1")
+            await wait_for(pilot, lambda: isinstance(app.screen, HelpScreen))
+            help_text = str(app.screen.query_one("#help Static", Static).render())
+            for key in ("ctrl+n", "ctrl+o", "ctrl+g", "ctrl+f", "ctrl+l", "ctrl+t", "ctrl+y", "ctrl+s", "ctrl+p"):
+                assert key in help_text
+            assert "Only in ctrl+p" in help_text and "archived" in help_text
+
+    asyncio.run(run())
+    server.close()
+
+
+def test_a_nonsense_saved_side_width_is_ignored(tmp_path, monkeypatch):
+    for bad in ("wide", 0, 400, None, [50]):
+        Store(tmp_path / "state.json").set_ui(side_width=bad)
+        server, _, app = setup(tmp_path, monkeypatch)
+        assert app.side_pct is None  # falls back to the stylesheet's 58%
+        server.close()

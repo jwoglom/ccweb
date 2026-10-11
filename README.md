@@ -55,7 +55,7 @@ claude --teleport            # open the picker, pick a session, then quit
 
 ## Home page and new sessions
 
-The app opens on the home page: the sessions that need you (recent unread questions first, then work ready for review) and a box to start a new cloud session. Press `n` or click **+ New session** to return to it from a conversation.
+The app opens on the home page: the sessions that need you (recent unread questions first, then work ready for review) and a box to start a new cloud session. Press `Ctrl+N` or click **+ New session** to return to it from a conversation.
 
 The chips around the box are the web's settings. Tab to one and press enter, or click it:
 
@@ -90,13 +90,13 @@ Each sidebar row has a second line with the same information in brief: `Draft #5
 
 State, size, and the review decision come from the same batched endpoint the web sidebar uses. The sidebar uses it too: a session you've already seen shows a PR icon instead of the hollow dot (gray for open or draft, purple for merged, red for closed), and a session with a live PR counts as ready for review on the home page. Unread still wins over the PR icon, as on the web.
 
-That endpoint leaves CI results empty, so check counts come from the `gh` CLI. Press `D` (shift+d) for the PR summary: every check (failures first), the changed files and the whole diff, colored. In that view `o` opens the PR on GitHub, `r` reloads and `Esc` closes. Without `gh` (install it and run `gh auth login`), the strip still shows state and size, and the view says what's missing. The diff is cut at 4,000 lines.
+That endpoint leaves CI results empty, so check counts come from the `gh` CLI. Open the PR summary from the **PR** button at the top of the Changes panel, or from `Ctrl+P` (see Keys): every check (failures first), the changed files and the whole diff, colored. In that view `o` opens the PR on GitHub, `r` reloads and `Esc` closes. Without `gh` (install it and run `gh auth login`), the strip still shows state and size, and the view says what's missing. The diff is cut at 4,000 lines.
 
 Both are looked up as the sessions refresh (every 30 seconds for the sidebar, every 15 for the open session), and only for your newest 40 sessions. A session that opened PRs in several repositories shows each one.
 
 ## Side panels: Plan, Files and Changes
 
-Like the web's right-hand panel. Toggle them with `d`, `f` and `p`, or the `±`, `▤` and `✓` buttons beside the title (the `✓` shows progress, such as `✓ 5/8`). Any two or three can be open at once, stacked as on the web: Plan on top, then Files, then Changes. `z` (or `⤢`) expands the panel to fill the window and back, and `×` closes one.
+Like the web's right-hand panel. Toggle them with `Ctrl+G` (Changes), `Ctrl+F` (Files) and `Ctrl+L` (Plan), or the `±`, `▤` and `✓` buttons beside the title (the `✓` shows progress, such as `✓ 5/8`). Any two or three can be open at once, stacked as on the web: Plan on top, then Files, then Changes. `⤢` expands the panel to fill the window and back, and `×` closes one. Drag the thin bar between the conversation and the panel to change how wide it is; ccweb remembers the width.
 
 | Panel | Shows | Comes from |
 | --- | --- | --- |
@@ -108,7 +108,7 @@ Changes and Files need the `gh` CLI, signed in with access to the repository; Pl
 
 ## Session menu
 
-Press `m` on a session, right-click it (in the sidebar, on the home list, or anywhere in its conversation), or use the `⋮` button next to the title. The menu mirrors the web's, with the same shortcut letters while it's open:
+Press `Ctrl+O` on a session, right-click it (in the sidebar, on the home list, or anywhere in its conversation), or use the `⋮` button next to the title. The menu mirrors the web's, with the same shortcut letters while it's open:
 
 | Item | Key | What it does |
 | --- | --- | --- |
@@ -130,9 +130,9 @@ The sidebar groups sessions the way the web's does: a **Pinned** section on top,
 
 These are **kept on this machine, not shared with the web**. claude.ai stores your groups and pins in a settings document whose endpoint answers "This endpoint does not accept OAuth access tokens", so the Claude Code login ccweb uses can't read or change them. A group made here won't appear on the web, and the web's groups don't appear here.
 
-- Make or fill a group: `m` on a session, then **Move to group** (or **New group…**).
-- On a group header: `Enter` collapses it, and right-click or `m` opens its menu (Collapse, Rename group, Delete group). Deleting a group only returns its sessions to Ungrouped.
-- `g` switches between the grouped view and one flat list.
+- Make or fill a group: `Ctrl+O` on a session, then **Move to group** (or **New group…**).
+- On a group header: `Enter` collapses it, and right-click or `Ctrl+O` opens its menu (Collapse, Rename group, Delete group). Deleting a group only returns its sessions to Ungrouped.
+- **Show groups or one flat list** (in `Ctrl+P`) switches between the grouped view and one flat list.
 - Stored in the state file as group names and session IDs, nothing else. Deleting a session also drops it from any group and from the pins.
 
 ## Links, selecting and copying
@@ -143,29 +143,38 @@ Drag to select text anywhere in a conversation, the PR header or the diff, then 
 
 ## Keys
 
-While the prompt box has focus (the home page opens that way), letters are typed into it. Press `Esc` first to use the shortcuts below, or `F1` for help from anywhere.
+Every shortcut needs `Ctrl`, so a text box can keep focus: the prompt on the home page and the reply box in a conversation take whatever you type, and nothing in them is mistaken for a command. `F1` shows this list from anywhere.
 
 | Key | Action |
 | --- | --- |
-| `↑` `↓` | Move between sessions |
+| `↑` `↓` | Move between sessions (after `Esc`, which leaves the text box) |
 | `Enter` | Open the session and jump to the reply box |
-| `Esc` | Back to the session list |
-| `n` | Home page: start a new session |
-| `m` | Session menu (rename, pin, group, archive, delete, and the rest); on a group header, the group's menu |
-| `g` | Show groups or one flat list |
-| `i` | Add a session by its claude.ai/code link |
-| `o` | Open on claude.ai |
-| `y` | Copy link |
-| `d` `f` `p` | Open the Changes, Files and Plan panels (again to close); `z` expands the panel |
-| `D` | Pull request summary and CI checks |
-| `t` | Teleport into the local checkout |
-| `c` | Set the local checkout used for teleport |
-| `/` | Search |
-| `v` | Show or hide archived sessions |
-| `r` | Refresh now |
-| `x` | Forget a session you added here |
-| `?` / `F1` | Help |
-| `q` | Quit |
+| `Esc` | Leave the text box and go back to the session list |
+| `Ctrl+N` | Home page: start a new session |
+| `Ctrl+O` | Session menu (rename, pin, group, archive, delete, open in, and the rest); on a group header, the group's menu |
+| `Ctrl+G` `Ctrl+F` `Ctrl+L` | Open the Changes, Files and Plan panels (again to close) |
+| `Ctrl+T` | Teleport into the local checkout |
+| `Ctrl+Y` | Copy link |
+| `Ctrl+S` | Search sessions |
+| `Ctrl+R` | Refresh now |
+| `Ctrl+P` | A searchable list of every action (below) |
+| `F1` | Help |
+| `Ctrl+Q` | Quit |
+
+There are more actions than ctrl keys that a terminal and a text box leave free (`Ctrl+A`, `E`, `D`, `K`, `U` and `W` edit text, `Ctrl+X`, `C` and `V` cut, copy and paste, `Ctrl+I`, `M`, `H` and `J` arrive as Tab, Enter, Backspace and a newline, and `Ctrl+B` is tmux's prefix). So these have no key of their own; press `Ctrl+P` and type a few letters of the name:
+
+| Action | Type |
+| --- | --- |
+| Open on claude.ai | `open` |
+| Add a session by its claude.ai/code link | `add` |
+| Pull request summary and CI checks | `pull` |
+| Expand or restore the side panel | `expand` |
+| Show or hide archived sessions | `archived` |
+| Show groups or one flat list | `groups` |
+| Set the local checkout used for teleport | `checkout` |
+| Forget a session you added here | `forget` |
+
+The pop-ups, the session menu (letters beside each item) and the PR summary (`o`, `r`, `q`), have no text box, so their keys are plain letters.
 
 From a script:
 
@@ -183,7 +192,7 @@ A message you send shows in the conversation straight away, marked `sending…` 
 - macOS may ask once whether to allow Keychain access.
 - When the token has expired, ccweb runs `claude auth status` so the CLI refreshes it, then reads it again. ccweb never runs its own sign-in.
 - `CCWEB_ACCESS_TOKEN` overrides the token for testing. Don't put it in shell startup files.
-- Conversations are never written to disk. The local state file (`~/.local/share/ccweb/state.json`, owner-only) holds only session IDs you added, checkout paths, your last new-session settings (environment, repositories and branches, mode, model, effort), and your sidebar groups and pins (names and session IDs).
+- Conversations are never written to disk. The local state file (`~/.local/share/ccweb/state.json`, owner-only) holds only session IDs you added, checkout paths, your last new-session settings (environment, repositories and branches, mode, model, effort), your sidebar groups and pins (names and session IDs), and how wide you dragged the side panel.
 - The greeting reads your first name from the local `~/.claude.json`. Nothing is sent anywhere for it.
 - Requests identify themselves honestly as `ccweb/0.1` and don't impersonate the CLI.
 

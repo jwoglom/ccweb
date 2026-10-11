@@ -33,3 +33,10 @@ def test_store_is_private(tmp_path):
     again = Store(store.path)
     assert again.known["session_01Abcdefghijkl"]["title"] == "t"
     assert again.checkout_for("owner/repo") == "/tmp"
+
+
+def test_layout_choices_are_kept(tmp_path):
+    store = Store(tmp_path / "state.json")
+    assert store.ui == {}
+    store.set_ui(side_width=42.5)
+    assert Store(store.path).ui == {"side_width": 42.5}
